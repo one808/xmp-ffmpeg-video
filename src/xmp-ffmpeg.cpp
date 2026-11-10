@@ -39,6 +39,9 @@ extern "C" {
 #endif
 #define PLUGIN_VER  XMP_FFMPEG_VERSION
 
+#define WM_APP_SHOW (WM_APP + 1) // posted window ops run on the window thread
+#define WM_APP_HIDE (WM_APP + 2)
+
 static XMPFUNC_IN     *xmpfin;
 static XMPFUNC_MISC   *xmpfmisc;
 static XMPFUNC_FILE   *xmpffile;
@@ -105,6 +108,11 @@ struct VIDEO {
 	BOOL saved_valid;
 	BOOL hidden;
 	char title[512];
+	// playback clock: captured on XMPlay's thread, interpolated here. The
+	// render thread must NEVER call XMPlay functions (deadlock risk).
+	double clock_base;
+	DWORD clock_tick;
+	int show_w, show_h;
 };
 static VIDEO video;
 
@@ -337,6 +345,12 @@ static void video_enqueue(AVPacket *pkt)
 	n->next = 0;
 	n->pkt = pkt;
 	EnterCriticalSection(&video.lock);
+	if (video.qcount > 600) { // bounded queue: drop the new packet instead of
+		LeaveCriticalSection(&video.lock); // growing without limit
+		av_packet_free(&pkt);
+		free(n);
+		return;
+	}
 	if (video.qtail) video.qtail->next = n; else video.qhead = n;
 	video.qtail = n;
 	video.qcount++;
@@ -354,6 +368,24 @@ static void video_flush()
 	video.v_eof_sent = video.demux_eof_seen = FALSE;
 	if (video.vdec) avcodec_flush_buffers(video.vdec);
 	LeaveCriticalSection(&video.lock);
+}
+
+// -- playback clock (captured on XMPlay's thread, interpolated on ours)
+
+static void video_clock_capture(double t)
+{
+	EnterCriticalSection(&video.lock);
+	video.clock_base = t;
+	video.clock_tick = GetTickCount();
+	LeaveCriticalSection(&video.lock);
+}
+
+static double video_clock_now()
+{
+	EnterCriticalSection(&video.lock);
+	double t = video.clock_base + (double)(GetTickCount() - video.clock_tick) * 0.001;
+	LeaveCriticalSection(&video.lock);
+	return t;
 }
 
 // -- rendering
@@ -414,7 +446,7 @@ static void video_render_frame()
 static void video_tick()
 {
 	if (!video.active || video.hidden || !video.vdec) return;
-	double t = xmpfstatus->GetTime(); // audio clock (seconds)
+	double t = video_clock_now(); // interpolated playback clock
 	EnterCriticalSection(&video.lock);
 	if (!video.active) { LeaveCriticalSection(&video.lock); return; }
 	for (;;) {
@@ -515,6 +547,20 @@ static LRESULT CALLBACK video_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 	}
 	case WM_ERASEBKGND:
 		return 1;
+	case WM_APP_SHOW: {
+		SetWindowPos(video.hwnd, HWND_TOP, 0, 0, video.show_w, video.show_h,
+			SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED);
+		WCHAR wt[512];
+		MultiByteToWideChar(CP_UTF8, 0, video.title, -1, wt, 512);
+		SetWindowTextW(video.hwnd, wt);
+		ShowWindow(video.hwnd, SW_SHOW);
+		SetForegroundWindow(video.hwnd);
+		return 0;
+	}
+	case WM_APP_HIDE:
+		video.hidden = TRUE;
+		ShowWindow(video.hwnd, SW_HIDE);
+		return 0;
 	case WM_TIMER:
 		video_tick();
 		return 0;
@@ -569,15 +615,12 @@ static void video_show(FFMPEG *f)
 	RECT wa; SystemParametersInfo(SPI_GETWORKAREA, 0, &wa, 0);
 	int maxw = (int)((wa.right - wa.left) * 0.85), maxh = (int)((wa.bottom - wa.top) * 0.85);
 	while (w > maxw || h > maxh) { w = w * 9 / 10; h = h * 9 / 10; }
-	SetWindowPos(video.hwnd, HWND_TOP, 0, 0, w, h, SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED);
-	{
-		WCHAR wt[512];
-		MultiByteToWideChar(CP_UTF8, 0, video.title, -1, wt, 512);
-		SetWindowTextW(video.hwnd, wt);
-	}
+	// ALL window operations happen on the window thread (posted, never
+	// cross-thread SendMessage) - see WM_APP_SHOW below.
+	video.show_w = w;
+	video.show_h = h;
 	video.hidden = FALSE;
-	ShowWindow(video.hwnd, SW_SHOW);
-	SetForegroundWindow(video.hwnd);
+	PostMessage(video.hwnd, WM_APP_SHOW, 0, 0);
 }
 
 // called after a successful Open: attach this file's video to the window
@@ -609,7 +652,7 @@ static void video_detach()
 	video.have_frame = FALSE;
 	video.vdec = 0; video.fmt = 0;
 	LeaveCriticalSection(&video.lock);
-	if (video.hwnd) { video.hidden = TRUE; ShowWindow(video.hwnd, SW_HIDE); }
+	if (video.hwnd) PostMessage(video.hwnd, WM_APP_HIDE, 0, 0);
 }
 
 // ============================================================= XMPIN methods
@@ -653,13 +696,14 @@ static DWORD WINAPI FF_Open(const char *filename, XMPFILE file)
 	current = InitFF(filename, file);
 	if (!current) return 0;
 	current->pos = 0;
+	video_clock_capture(0);
 	xmpfin->SetLength((float)(current->duration > 0 ? current->duration : -1), current->seekable);
 	if (current->netfile)
 		xmpffile->NetSetRate(file, current->bitrate ? current->bitrate * 125 : 32000);
 	// window title (stored UTF-8)
 	{
 		char t[460];
-		sprintf(t, "%s - " PLUGIN_NAME, filename ? filename : "");
+		snprintf(t, sizeof(t), "%s - " PLUGIN_NAME, filename ? filename : "");
 		strncpy(video.title, t, sizeof(video.title) - 1);
 		video.title[sizeof(video.title) - 1] = 0;
 	}
@@ -725,6 +769,7 @@ static void WINAPI FF_GetMessage(char *buf)
 static DWORD WINAPI FF_Process(float *buffer, DWORD count)
 {
 	FFMPEG *f = current;
+	if (video.active) video_clock_capture(xmpfstatus->GetTime());
 	DWORD done = 0;
 	int ch = f->dec->ch_layout.nb_channels;
 	if (ch < 1) ch = 1;
@@ -805,6 +850,7 @@ static double WINAPI FF_SetPosition(DWORD pos)
 	f->eof = f->sent_eof = FALSE;
 	f->demux_eof = FALSE;
 	video_flush(); // reposition the video too
+	video_clock_capture(t);
 	f->pos = t;
 	return t;
 }
