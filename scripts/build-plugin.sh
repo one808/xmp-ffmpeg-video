@@ -33,7 +33,7 @@ echo "== linking xmp-ffmpeg.dll (static) =="
 # -lpthread (there is no -lwinpthread in this toolchain).
 export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig"
 export PKG_CONFIG_LIBDIR=
-FFLIBS=$(pkg-config --static --libs libavformat libavcodec libswresample libavutil)
+FFLIBS=$(pkg-config --static --libs libavformat libavcodec libswresample libswscale libavutil)
 echo "link libs: $FFLIBS"
 # g++ driver + -static-libstdc++/-static-libgcc: the dep .pc files pull in
 # -lstdc++ (gme is C++), and we must NOT end up importing libstdc++-6.dll /
