@@ -97,6 +97,11 @@ struct VIDEO {
 	// rendering
 	SwsContext *sws;
 	int sws_w, sws_h, sws_fmt;
+	// persistent double buffer (render thread only), rebuilt on size change
+	HDC memdc;
+	HBITMAP membmp;
+	HGDIOBJ memold;
+	int memw, memh;
 	AVFrame *vframe;
 	BOOL have_frame;           // decoded frame in vframe, waiting for its time
 	double frame_pts;
@@ -399,30 +404,49 @@ static void video_paint(HDC dc)
 	RECT rc;
 	GetClientRect(video.hwnd, &rc);
 	int cw = rc.right, ch = rc.bottom;
-	// always clear the whole client: no stale pixels around the letterbox
-	HBRUSH black = (HBRUSH)GetStockObject(BLACK_BRUSH);
-	FillRect(dc, &rc, black);
-	if (cw < 1 || ch < 1 || !video.dib || video.dibw < 1) return;
+	if (cw < 1 || ch < 1) return;
 
-	// display aspect honors non-square pixels (DVD/TS/MKV anamorphic sources)
-	double sar = 1.0;
-	AVRational fsar = video.frame_sar;
-	if (fsar.num <= 0 || fsar.den <= 0) fsar = video.sar;
-	if (fsar.num > 0 && fsar.den > 0) sar = (double)fsar.num / fsar.den;
+	// double buffering: compose into an offscreen bitmap, blit once. Painting
+	// black-then-frame straight to the window flickers visibly.
+	if (!video.memdc || video.memw != cw || video.memh != ch) {
+		if (video.memdc) {
+			SelectObject(video.memdc, video.memold);
+			DeleteObject(video.membmp);
+			DeleteDC(video.memdc);
+		}
+		video.memdc = CreateCompatibleDC(dc);
+		video.membmp = CreateCompatibleBitmap(dc, cw, ch);
+		video.memold = SelectObject(video.memdc, video.membmp);
+		video.memw = cw;
+		video.memh = ch;
+	}
+	HDC mem = video.memdc;
 
-	int w, h, x, y;
-	double va = (double)video.dibw / video.dibh * sar, wa = (double)cw / ch;
-	if (wa > va) { h = ch; w = (int)(h * va + 0.5); x = (cw - w) / 2; y = 0; }
-	else { w = cw; h = (int)(w / va + 0.5); x = 0; y = (ch - h) / 2; }
-	if (w < 1) w = 1;
-	if (h < 1) h = 1;
+	// clear the whole client: no stale pixels around the letterbox
+	FillRect(mem, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
 
-	// smooth (filtered) scaling - the default nearest-neighbor looks terrible
-	// when the window is scaled down
-	int oldmode = SetStretchBltMode(dc, HALFTONE);
-	StretchDIBits(dc, x, y, w, h, 0, 0, video.dibw, video.dibh,
-		video.dib, &video.bmi, DIB_RGB_COLORS, SRCCOPY);
-	SetStretchBltMode(dc, oldmode);
+	if (video.dib && video.dibw >= 1) {
+		// display aspect honors non-square pixels (DVD/TS/MKV anamorphic sources)
+		double sar = 1.0;
+		AVRational fsar = video.frame_sar;
+		if (fsar.num <= 0 || fsar.den <= 0) fsar = video.sar;
+		if (fsar.num > 0 && fsar.den > 0) sar = (double)fsar.num / fsar.den;
+
+		int w, h, x, y;
+		double va = (double)video.dibw / video.dibh * sar, wa = (double)cw / ch;
+		if (wa > va) { h = ch; w = (int)(h * va + 0.5); x = (cw - w) / 2; y = 0; }
+		else { w = cw; h = (int)(w / va + 0.5); x = 0; y = (ch - h) / 2; }
+		if (w < 1) w = 1;
+		if (h < 1) h = 1;
+
+		// smooth (filtered) scaling
+		int oldmode = SetStretchBltMode(mem, HALFTONE);
+		StretchDIBits(mem, x, y, w, h, 0, 0, video.dibw, video.dibh,
+			video.dib, &video.bmi, DIB_RGB_COLORS, SRCCOPY);
+		SetStretchBltMode(mem, oldmode);
+	}
+
+	BitBlt(dc, 0, 0, cw, ch, mem, 0, 0, SRCCOPY);
 }
 
 static BOOL video_make_dib(int w, int h)
@@ -583,9 +607,7 @@ static LRESULT CALLBACK video_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 	case WM_PAINT: {
 		PAINTSTRUCT ps;
 		HDC dc = BeginPaint(hwnd, &ps);
-		RECT rc; GetClientRect(hwnd, &rc);
-		FillRect(dc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
-		if (video.dib) video_paint(dc);
+		video_paint(dc); // double buffered: black + frame composed offscreen
 		EndPaint(hwnd, &ps);
 		return 0;
 	}
