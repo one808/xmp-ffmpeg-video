@@ -586,15 +586,45 @@ static void video_toggle_fullscreen()
 static LRESULT CALLBACK video_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
 	switch (msg) {
-	case WM_NCHITTEST: // borderless: drag by the client area (resize via frame)
-		if (!video.fullscreen) {
-			LRESULT r = DefWindowProc(hwnd, msg, wp, lp);
-			return (r == HTCLIENT) ? HTCAPTION : r;
+	case WM_NCCALCSIZE: // the ENTIRE window is client area: no painted frame
+		return 0;       // (WS_THICKFRAME stays only so HT* resizing works)
+	case WM_NCPAINT:
+		return 0;       // nothing non-client to paint - no white edge
+	case WM_NCHITTEST: { // borderless: manual resize edges + drag + resize
+		if (video.fullscreen) return HTCLIENT;
+		POINT pt;
+		pt.x = (short)((DWORD)lp & 0xffff);
+		pt.y = (short)(((DWORD)lp >> 16) & 0xffff);
+		RECT wr;
+		GetWindowRect(hwnd, &wr);
+		int b = 8; // resize border width in px
+		BOOL l = pt.x < wr.left + b, r = pt.x >= wr.right - b;
+		BOOL t = pt.y < wr.top + b, bo = pt.y >= wr.bottom - b;
+		if (t && l) return HTTOPLEFT;
+		if (t && r) return HTTOPRIGHT;
+		if (bo && l) return HTBOTTOMLEFT;
+		if (bo && r) return HTBOTTOMRIGHT;
+		if (t) return HTTOP;
+		if (bo) return HTBOTTOM;
+		if (l) return HTLEFT;
+		if (r) return HTRIGHT;
+		return HTCAPTION; // drag anywhere else
+	}
+	case WM_NCLBUTTONDBLCLK: // double-click on the drag area (our client is
+		if (wp == HTCAPTION) { // reported as caption!) = fullscreen toggle
+			video_toggle_fullscreen();
+			return 0;
 		}
 		break;
 	case WM_LBUTTONDBLCLK:
 		video_toggle_fullscreen();
 		return 0;
+	case WM_GETMINMAXINFO: { // keep a sane minimum size
+		MINMAXINFO *mm = (MINMAXINFO*)lp;
+		mm->ptMinTrackSize.x = 160;
+		mm->ptMinTrackSize.y = 120;
+		return 0;
+	}
 	case WM_KEYDOWN:
 		if (wp == 'F') { video_toggle_fullscreen(); return 0; }
 		if (wp == VK_ESCAPE) {
