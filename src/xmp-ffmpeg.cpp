@@ -48,6 +48,7 @@ static XMPFUNC_FILE   *xmpffile;
 static XMPFUNC_TEXT   *xmpftext;
 static XMPFUNC_STATUS *xmpfstatus;
 static DWORD xmpver;
+static HWND xmpwin; // XMPlay's main window - owner of the video window
 
 struct FFMPEG {
 	XMPFILE file;
@@ -644,6 +645,7 @@ static LRESULT CALLBACK video_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 	case WM_ERASEBKGND:
 		return 1;
 	case WM_APP_SHOW: {
+		if (xmpwin) SetWindowLong(video.hwnd, GWL_HWNDPARENT, (LONG)xmpwin);
 		SetWindowPos(video.hwnd, HWND_TOP, 0, 0, video.show_w, video.show_h,
 			SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED);
 		WCHAR wt[512];
@@ -681,7 +683,7 @@ static DWORD WINAPI video_thread(LPVOID)
 
 	video.hwnd = CreateWindowEx(WS_EX_TOOLWINDOW, "xmp-ffmpeg-video", "xmp-ffmpeg",
 		WS_POPUP | WS_THICKFRAME, CW_USEDEFAULT, CW_USEDEFAULT, 640, 480,
-		0, 0, wc.hInstance, 0);
+		xmpwin, 0, wc.hInstance, 0); // owner = XMPlay main window
 	SetTimer(video.hwnd, 1, 15, 0);
 	SetEvent(video.ready);
 
@@ -1015,6 +1017,8 @@ extern "C" __declspec(dllexport) XMPIN *WINAPI XMPIN_GetInterface(DWORD face, In
 	xmpftext  = (XMPFUNC_TEXT*)faceproc(XMPFUNC_TEXT_FACE);
 	xmpfstatus = (XMPFUNC_STATUS*)faceproc(XMPFUNC_STATUS_FACE);
 	xmpver = xmpfmisc->GetVersion();
+	xmpwin = GetActiveWindow();
+	if (!xmpwin) xmpwin = GetForegroundWindow();
 	InitializeCriticalSection(&video.lock);
 	video.ready = 0;
 	video.vframe = av_frame_alloc();
