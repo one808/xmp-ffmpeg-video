@@ -113,6 +113,7 @@ struct VIDEO {
 	double clock_base;
 	DWORD clock_tick;
 	int show_w, show_h;
+	double last_pts, frame_dur;   // pts fallback for streams without stamps
 };
 static VIDEO video;
 
@@ -374,6 +375,7 @@ static void video_flush()
 
 static void video_clock_capture(double t)
 {
+	if (!(t > -1e6 && t < 1e7)) return; // NaN/garbage: keep interpolating
 	EnterCriticalSection(&video.lock);
 	video.clock_base = t;
 	video.clock_tick = GetTickCount();
@@ -441,15 +443,21 @@ static void video_render_frame()
 	if (dc) { video_paint(dc); ReleaseDC(video.hwnd, dc); }
 }
 
-// -- sync tick: decode/present frames due at XMPlay's playback position
+// -- sync tick: decode/present frames due at the playback position.
+// BOUNDED work per call: without a budget, a broken timestamp stream (all
+// frames "late") makes this loop decode forever while the audio thread keeps
+// feeding packets - 100% CPU spin, starved audio, eventual crash.
 
 static void video_tick()
 {
 	if (!video.active || video.hidden || !video.vdec) return;
 	double t = video_clock_now(); // interpolated playback clock
+	BOOL do_render = FALSE;
+
 	EnterCriticalSection(&video.lock);
 	if (!video.active) { LeaveCriticalSection(&video.lock); return; }
-	for (;;) {
+	int budget = 8; // max decode/feed iterations this tick
+	while (budget-- > 0) {
 		if (!video.have_frame) {
 			int ret = avcodec_receive_frame(video.vdec, video.vframe);
 			if (ret == AVERROR(EAGAIN)) {
@@ -472,24 +480,33 @@ static void video_tick()
 				break; // starved - wait for more packets
 			}
 			if (ret < 0) break; // drained or error
-			double pts = t; // fall back to the clock when no stamp
-			if (video.vframe->best_effort_timestamp != AV_NOPTS_VALUE)
+			// timestamp: real pts when present, else advance from the last one
+			double pts;
+			if (video.vframe->best_effort_timestamp != AV_NOPTS_VALUE) {
 				pts = video.vframe->best_effort_timestamp * av_q2d(video.tb);
+			} else {
+				pts = video.last_pts + video.frame_dur;
+			}
+			if (pts > video.last_pts) video.last_pts = pts;
 			video.frame_pts = pts;
 			video.have_frame = TRUE;
 			continue;
 		}
 		// have a decoded frame: show it when due, drop when far too late
 		if (video.frame_pts > t + 0.06) break;   // in the future - wait
-		if (video.frame_pts < t - 0.30) {        // way behind - drop
-			video.have_frame = FALSE;
+		if (video.frame_pts < t - 0.30 && budget > 2) { // behind - drop, but
+			video.have_frame = FALSE;            // never burn the whole budget
 			continue;
 		}
-		video_render_frame();
+		do_render = TRUE;
 		video.have_frame = FALSE;
 		break; // one present per tick is enough
 	}
 	LeaveCriticalSection(&video.lock);
+
+	// heavy work (scale + blit) happens OUTSIDE the lock so the audio thread
+	// never waits behind GDI
+	if (do_render) video_render_frame();
 }
 
 // -- window
@@ -636,6 +653,12 @@ static void video_attach(FFMPEG *f)
 	video.vdec = f->vdec;
 	video.vstream = f->vstream;
 	video.tb = f->fmt->streams[f->vstream]->time_base;
+	video.last_pts = -1;
+	video.frame_dur = 0.04;
+	{
+		AVRational fr = f->fmt->streams[f->vstream]->avg_frame_rate;
+		if (fr.num > 0 && fr.den > 0) video.frame_dur = (double)fr.den / fr.num;
+	}
 	video.active = TRUE;
 	LeaveCriticalSection(&video.lock);
 	video_show(f);
