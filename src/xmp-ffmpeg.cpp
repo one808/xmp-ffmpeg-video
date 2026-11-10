@@ -114,6 +114,8 @@ struct VIDEO {
 	DWORD clock_tick;
 	int show_w, show_h;
 	double last_pts, frame_dur;   // pts fallback for streams without stamps
+	AVRational sar;               // non-square pixel ratio (display aspect)
+	AVRational frame_sar;         // per-frame override when present
 };
 static VIDEO video;
 
@@ -397,13 +399,30 @@ static void video_paint(HDC dc)
 	RECT rc;
 	GetClientRect(video.hwnd, &rc);
 	int cw = rc.right, ch = rc.bottom;
+	// always clear the whole client: no stale pixels around the letterbox
+	HBRUSH black = (HBRUSH)GetStockObject(BLACK_BRUSH);
+	FillRect(dc, &rc, black);
 	if (cw < 1 || ch < 1 || !video.dib || video.dibw < 1) return;
+
+	// display aspect honors non-square pixels (DVD/TS/MKV anamorphic sources)
+	double sar = 1.0;
+	AVRational fsar = video.frame_sar;
+	if (fsar.num <= 0 || fsar.den <= 0) fsar = video.sar;
+	if (fsar.num > 0 && fsar.den > 0) sar = (double)fsar.num / fsar.den;
+
 	int w, h, x, y;
-	double va = (double)video.dibw / video.dibh, wa = (double)cw / ch;
+	double va = (double)video.dibw / video.dibh * sar, wa = (double)cw / ch;
 	if (wa > va) { h = ch; w = (int)(h * va + 0.5); x = (cw - w) / 2; y = 0; }
 	else { w = cw; h = (int)(w / va + 0.5); x = 0; y = (ch - h) / 2; }
+	if (w < 1) w = 1;
+	if (h < 1) h = 1;
+
+	// smooth (filtered) scaling - the default nearest-neighbor looks terrible
+	// when the window is scaled down
+	int oldmode = SetStretchBltMode(dc, HALFTONE);
 	StretchDIBits(dc, x, y, w, h, 0, 0, video.dibw, video.dibh,
 		video.dib, &video.bmi, DIB_RGB_COLORS, SRCCOPY);
+	SetStretchBltMode(dc, oldmode);
 }
 
 static BOOL video_make_dib(int w, int h)
@@ -496,6 +515,7 @@ static void video_tick()
 			}
 			if (pts > video.last_pts) video.last_pts = pts;
 			video.frame_pts = pts;
+			video.frame_sar = video.vframe->sample_aspect_ratio;
 			video.have_frame = TRUE;
 			continue;
 		}
@@ -668,6 +688,7 @@ static void video_attach(FFMPEG *f)
 		AVRational fr = f->fmt->streams[f->vstream]->avg_frame_rate;
 		if (fr.num > 0 && fr.den > 0) video.frame_dur = (double)fr.den / fr.num;
 	}
+	video.sar = av_guess_sample_aspect_ratio(f->fmt, f->fmt->streams[f->vstream], NULL);
 	video.active = TRUE;
 	LeaveCriticalSection(&video.lock);
 	video_show(f);
