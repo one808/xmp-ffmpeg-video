@@ -467,7 +467,14 @@ static void video_tick()
 					video.qhead = n->next;
 					if (!video.qhead) video.qtail = 0;
 					video.qcount--;
-					avcodec_send_packet(video.vdec, n->pkt);
+					if (avcodec_send_packet(video.vdec, n->pkt) == AVERROR(EAGAIN)) {
+						// decoder is full - put the packet back and drain first
+						n->next = video.qhead;
+						video.qhead = n;
+						if (!video.qtail) video.qtail = n;
+						video.qcount++;
+						break;
+					}
 					av_packet_free(&n->pkt);
 					free(n);
 					continue;
@@ -617,6 +624,8 @@ static DWORD WINAPI video_thread(LPVOID)
 static void video_window_init()
 {
 	if (video.running) return;
+	video.clock_base = 0;
+	video.clock_tick = GetTickCount();
 	video.ready = CreateEvent(0, TRUE, FALSE, 0);
 	video.thread = CreateThread(0, 0, video_thread, 0, 0, &video.threadid);
 	if (video.ready) WaitForSingleObject(video.ready, 3000);
@@ -935,6 +944,7 @@ extern "C" __declspec(dllexport) XMPIN *WINAPI XMPIN_GetInterface(DWORD face, In
 	xmpver = xmpfmisc->GetVersion();
 	InitializeCriticalSection(&video.lock);
 	video.ready = 0;
+	video.vframe = av_frame_alloc();
 	return &xmpin;
 }
 
