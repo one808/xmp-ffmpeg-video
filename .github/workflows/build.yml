@@ -1,0 +1,99 @@
+# Build xmp-ffmpeg.dll on GitHub Actions: cross toolchain + lean static FFmpeg
+# (XP target) + the plugin, then audit the result for XP compatibility.
+name: build xmp-ffmpeg-video
+
+run-name: "xmp-ffmpeg · ${{ inputs.linkage || 'static' }}"
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write # for the 'latest' release upload
+
+concurrency:
+  group: xmp-ffmpeg-video-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355 # toolchain build is slow on the first run (~40min), cached after
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout ffmpeg-windows-build-helpers (toolchain recipe + XP patches)
+        uses: actions/checkout@v4
+        with:
+          repository: one808/ffmpeg-windows-build-helpers
+          ref: xp-core2
+          path: build-helpers
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            autoconf automake bison bzip2 cmake curl cvs ed flex g++ gcc git gperf libtool \
+            libtool-bin make texinfo patch pax pkg-config python3 subversion unzip wget \
+            xz-utils yasm nasm meson ninja-build gettext autopoint ca-certificates p7zip-full
+
+      - name: Restore build sandbox (toolchain + deps + FFmpeg, rolling cache)
+        uses: actions/cache/restore@v4
+        with:
+          path: sandbox
+          key: sandbox-${{ hashFiles('scripts/build-ffmpeg.sh', 'scripts/gen-component-lists.py') }}
+          restore-keys: |
+            sandbox-
+
+      - name: Build toolchain + FFmpeg
+        run: bash scripts/build-ffmpeg.sh
+
+      - name: Build plugin
+        run: bash scripts/build-plugin.sh
+
+      - name: XP compatibility audit
+        run: bash scripts/check-xp-compat.sh build/xmp-ffmpeg.dll
+
+      - name: Save build sandbox
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: sandbox
+          key: sandbox-${{ hashFiles('scripts/build-ffmpeg.sh', 'scripts/gen-component-lists.py') }}-${{ github.run_id }}
+
+      - name: Read version
+        if: success()
+        id: ver
+        run: |
+          VER=$(tr -d ' \n' < VERSION)
+          echo "ver=$VER" >> "$GITHUB_OUTPUT"
+
+      - name: Upload plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: xmp-ffmpeg-video-${{ steps.ver.outputs.ver }}
+          path: |
+            build/xmp-ffmpeg.dll
+            README.md
+          retention-days: 30
+
+      - name: Publish GitHub Release (add-only, never touches old releases)
+        if: success() && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VER=${{ steps.ver.outputs.ver }}
+          RUN=${{ github.run_number }}
+          7z a "xmp-ffmpeg-video-$VER.zip" build/xmp-ffmpeg.dll README.md
+          # ADD-ONLY: never delete/modify existing releases. Tag = v<version>,
+          # or v<version>.<run> when that version already has a release.
+          TAG="v$VER"
+          TITLE="xmp-ffmpeg-video $VER"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            TAG="v$VER.$RUN"
+            TITLE="xmp-ffmpeg-video $VER (build $RUN)"
+          fi
+          gh release create "$TAG" "xmp-ffmpeg-video-$VER.zip" --repo "$GITHUB_REPOSITORY" \
+            --title "$TITLE" \
+            --notes "Auto-built by GitHub Actions (run $RUN). Unzip and drop xmp-ffmpeg.dll into the XMPlay folder (use INSTEAD of the audio-only xmp-ffmpeg.dll, not alongside). All FFmpeg libraries are linked statically - no DLL dependencies."
