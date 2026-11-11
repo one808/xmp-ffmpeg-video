@@ -122,6 +122,8 @@ struct VIDEO {
 	double clock_base;
 	DWORD clock_tick;
 	int show_w, show_h;
+	BOOL size_set;           // default size applied once - NEVER resize the
+	                         // user's window afterwards
 	double last_pts, frame_dur;   // pts fallback for streams without stamps
 	AVRational sar;               // non-square pixel ratio (display aspect)
 	AVRational frame_sar;         // per-frame override when present
@@ -806,8 +808,16 @@ static LRESULT CALLBACK video_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 		return 1;
 	case WM_APP_SHOW: {
 		if (xmpwin) SetWindowLong(video.hwnd, GWL_HWNDPARENT, (LONG)xmpwin);
-		SetWindowPos(video.hwnd, HWND_TOP, 0, 0, video.show_w, video.show_h,
-			SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED);
+		// size: default ONCE at the first show, never afterwards - the user's
+		// window size (and fullscreen) is not to be touched during playback
+		if (!video.size_set) {
+			SetWindowPos(video.hwnd, HWND_TOP, 0, 0, video.show_w, video.show_h,
+				SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED);
+			video.size_set = TRUE;
+		} else {
+			SetWindowPos(video.hwnd, HWND_TOP, 0, 0, 0, 0,
+				SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER);
+		}
 		WCHAR wt[512];
 		MultiByteToWideChar(CP_UTF8, 0, video.title, -1, wt, 512);
 		SetWindowTextW(video.hwnd, wt);
