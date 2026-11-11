@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdarg.h>
 
 #include <windows.h>
 #include "xmpin.h"
@@ -69,6 +70,7 @@ struct FFMPEG {
 	float *outbuf;       // interleaved float32 staging buffer
 	DWORD outcap;        // capacity in floats
 	DWORD outlen, outp;  // floats valid / consumed
+	int recheck;         // lazy video discovery countdown
 	const char *codec;   // audio codec short name
 	int vw, vh;
 	const char *video_codec;
@@ -129,6 +131,25 @@ static void video_enqueue(AVPacket *pkt); // takes ownership
 static void video_flush();
 static void video_attach(FFMPEG *f);
 static void video_detach();
+
+// ------------------------------------------------------------- diagnostic log
+// Always-on lightweight log so field problems are diagnosable from the file.
+// Location: %TEMP%\xmp-ffmpeg-video.log
+
+static void logmsg(const char *fmt, ...)
+{
+	char dir[300];
+	if (!GetTempPathA(300, dir)) return;
+	strcat(dir, "xmp-ffmpeg-video.log");
+	FILE *f = fopen(dir, "a");
+	if (!f) return;
+	va_list ap;
+	va_start(ap, fmt);
+	vfprintf(f, fmt, ap);
+	va_end(ap);
+	fputc('\n', f);
+	fclose(f);
+}
 
 // ---------------------------------------------------------------- XMPFILE I/O
 
@@ -233,8 +254,24 @@ static FFMPEG *InitFF(const char *filename, XMPFILE file)
 	f->fmt->flags |= AVFMT_FLAG_CUSTOM_IO;
 	// pass the filename/URL: it is only a hint for our custom IO, but nested
 	// formats like HLS resolve their segment URLs against it (s->url)
-	if (avformat_open_input(&f->fmt, filename, NULL, NULL) < 0) goto fail;
-	if (avformat_find_stream_info(f->fmt, NULL) < 0) goto fail;
+	f->fmt->probesize = 32 * 1024 * 1024;      // stubborn streams (TS/HLS)
+	f->fmt->max_analyze_duration = 10 * 1000000;
+	// pass the filename/URL: it is only a hint for our custom IO, but nested
+	// formats like HLS resolve their segment URLs against it (s->url)
+	{
+		int ior = avformat_open_input(&f->fmt, filename, NULL, NULL);
+		if (ior < 0) {
+			logmsg("open_input FAILED %d file=%s", ior, filename ? filename : "?");
+			goto fail;
+		}
+	}
+	logmsg("open_input ok: format=%s streams=%u file=%s",
+		f->fmt->iformat ? f->fmt->iformat->name : "?", f->fmt->nb_streams, filename ? filename : "?");
+	if (avformat_find_stream_info(f->fmt, NULL) < 0) logmsg("find_stream_info failed (continuing)");
+	for (unsigned li = 0; li < f->fmt->nb_streams; li++) {
+		AVCodecParameters *lp = f->fmt->streams[li]->codecpar;
+		logmsg("  stream %u: type=%d codec=%d %dx%d", li, lp->codec_type, lp->codec_id, lp->width, lp->height);
+	}
 
 	{ // pick the audio stream
 		int s = av_find_best_stream(f->fmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
@@ -263,6 +300,7 @@ static FFMPEG *InitFF(const char *filename, XMPFILE file)
 				break;
 			}
 		}
+		logmsg("video scan: candidate stream idx=%d", vs);
 		if (vs >= 0) {
 			AVStream *st = f->fmt->streams[vs];
 			const AVCodec *c = avcodec_find_decoder(st->codecpar->codec_id);
@@ -275,10 +313,16 @@ static FFMPEG *InitFF(const char *filename, XMPFILE file)
 					f->vh = st->codecpar->height;
 					const AVCodecDescriptor *d = avcodec_descriptor_get(st->codecpar->codec_id);
 					f->video_codec = d ? d->name : c->name;
+					logmsg("video decoder OPEN: %s %dx%d", f->video_codec, f->vw, f->vh);
 				} else if (f->vdec) {
+					logmsg("video decoder open FAILED");
 					avcodec_free_context(&f->vdec);
 				}
+			} else {
+				logmsg("no video decoder for codec %d", st->codecpar->codec_id);
 			}
+		} else {
+			logmsg("no video stream found at open (may appear later)");
 		}
 	}
 
@@ -812,6 +856,7 @@ static BOOL WINAPI FF_CheckFile(const char *filename, XMPFILE file)
 	pd.buf_size = (int)n;
 	int score = 0;
 	const AVInputFormat *fmt = av_probe_input_format2(&pd, TRUE, &score);
+	logmsg("check: %s -> %s score=%d", filename ? filename : "?", fmt ? fmt->name : "none", score);
 	return fmt && score >= 25; // AVPROBE_SCORE_RETRY
 }
 
@@ -836,7 +881,9 @@ static DWORD WINAPI FF_Open(const char *filename, XMPFILE file)
 	current = InitFF(filename, file);
 	if (!current) return 0;
 	current->pos = 0;
+	current->recheck = 1; // first late-scan on the first Process call
 	video_clock_capture(0);
+	logmsg("OPEN: vstream=%d audio=%s", current->vstream, current->codec ? current->codec : "?");
 	xmpfin->SetLength((float)(current->duration > 0 ? current->duration : -1), current->seekable);
 	if (current->netfile)
 		xmpffile->NetSetRate(file, current->bitrate ? current->bitrate * 125 : 32000);
@@ -906,9 +953,43 @@ static void WINAPI FF_GetMessage(char *buf)
 	}
 }
 
+// HLS/TS streams can expose their video track LATE (variants load over time).
+// While no video is attached, rescan the stream list occasionally and attach
+// as soon as one shows up.
+static void video_late_scan(FFMPEG *f)
+{
+	if (f->vstream >= 0 || video.active) return;
+	if (--f->recheck > 0) return;
+	f->recheck = 200; // roughly every few seconds of audio
+	for (unsigned i = 0; i < f->fmt->nb_streams; i++) {
+		AVCodecParameters *p = f->fmt->streams[i]->codecpar;
+		if (p->codec_type != AVMEDIA_TYPE_VIDEO) continue;
+		const AVCodec *c = avcodec_find_decoder(p->codec_id);
+		if (!c) continue;
+		AVCodecContext *vdec = avcodec_alloc_context3(c);
+		if (!vdec) return;
+		if (avcodec_parameters_to_context(vdec, p) < 0 || avcodec_open2(vdec, c, NULL) < 0) {
+			avcodec_free_context(&vdec);
+			return;
+		}
+		EnterCriticalSection(&video.lock);
+		f->vstream = (int)i;
+		f->vdec = vdec;
+		f->vw = p->width;
+		f->vh = p->height;
+		const AVCodecDescriptor *d = avcodec_descriptor_get(p->codec_id);
+		f->video_codec = d ? d->name : c->name;
+		LeaveCriticalSection(&video.lock);
+		logmsg("late video attach: stream %u %s %dx%d", i, f->video_codec, f->vw, f->vh);
+		video_attach(f);
+		return;
+	}
+}
+
 static DWORD WINAPI FF_Process(float *buffer, DWORD count)
 {
 	FFMPEG *f = current;
+	video_late_scan(f);
 	if (video.active) video_clock_capture(xmpfstatus->GetTime());
 	DWORD done = 0;
 	int ch = f->dec->ch_layout.nb_channels;
