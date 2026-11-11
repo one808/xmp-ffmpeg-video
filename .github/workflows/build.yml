@@ -28,6 +28,7 @@ jobs:
         with:
           repository: one808/ffmpeg-windows-build-helpers
           ref: xp-core2
+
           path: build-helpers
 
       - name: Install build dependencies
@@ -41,6 +42,7 @@ jobs:
       - name: Restore build sandbox (toolchain + deps + FFmpeg, rolling cache)
         uses: actions/cache/restore@v4
         with:
+
           path: sandbox
           key: sandbox-${{ hashFiles('scripts/build-ffmpeg.sh', 'scripts/gen-component-lists.py') }}
           restore-keys: |
@@ -59,6 +61,7 @@ jobs:
         if: always()
         uses: actions/cache/save@v4
         with:
+
           path: sandbox
           key: sandbox-${{ hashFiles('scripts/build-ffmpeg.sh', 'scripts/gen-component-lists.py') }}-${{ github.run_id }}
 
@@ -73,6 +76,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: xmp-ffmpeg-video-${{ steps.ver.outputs.ver }}
+
           path: |
             build/xmp-ffmpeg.dll
             README.md
