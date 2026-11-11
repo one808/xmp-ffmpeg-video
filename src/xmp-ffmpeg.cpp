@@ -476,6 +476,7 @@ static void video_flush()
 	video.qcount = 0;
 	video.have_frame = FALSE;
 	video.v_eof_sent = video.demux_eof_seen = FALSE;
+	video.last_pts = -1; // new timeline after a seek
 	if (video.vdec) avcodec_flush_buffers(video.vdec);
 	LeaveCriticalSection(&video.lock);
 }
@@ -1119,8 +1120,28 @@ static double WINAPI FF_SetPosition(DWORD pos)
 {
 	FFMPEG *f = current;
 	double t = pos * 0.001;
-	if (!f->seekable) return -1;
-	if (av_seek_frame(f->fmt, -1, (int64_t)(t * AV_TIME_BASE), AVSEEK_FLAG_BACKWARD) < 0) return -1;
+	if (!f->seekable) { logmsg("seek: not seekable (t=%.2f)", t); return -1; }
+
+	// three strategies, in order; HLS is picky about which form it accepts
+	int r = av_seek_frame(f->fmt, -1, (int64_t)(t * AV_TIME_BASE), AVSEEK_FLAG_BACKWARD);
+	if (r < 0) {
+		AVStream *st = f->fmt->streams[f->stream];
+		int64_t sts = (int64_t)(t / av_q2d(st->time_base));
+		r = av_seek_frame(f->fmt, f->stream, sts, AVSEEK_FLAG_BACKWARD);
+		logmsg("seek: timebase retry -> %d (t=%.2f ts=%lld)", r, t, (long long)sts);
+	}
+	if (r < 0) {
+		AVStream *st = f->fmt->streams[f->stream];
+		int64_t sts = (int64_t)(t / av_q2d(st->time_base));
+		r = avformat_seek_file(f->fmt, f->stream, INT64_MIN, sts, INT64_MAX, 0);
+		logmsg("seek: seek_file retry -> %d (t=%.2f)", r, t);
+	}
+	if (r < 0) {
+		logmsg("seek: FAILED all strategies (t=%.2f)", t);
+		return -1;
+	}
+	logmsg("seek: ok t=%.2f", t);
+
 	avcodec_flush_buffers(f->dec);
 	swr_init(f->swr); // drop any resampler delay
 	f->outlen = f->outp = 0;
