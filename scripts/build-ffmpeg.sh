@@ -230,6 +230,16 @@ if [[ ! -f $FFSRC/.xp-patched ]]; then
 	  touch .xp-patched )
 fi
 
+# TLS peer verification: FFmpeg's tls layer defaults to verify=1, and HLS
+# nested (segment) opens do NOT inherit verify options (ffio_copy_url_options
+# copies only headers/UA/cookies/proxy/referrer/timeout). Media CDN segment
+# hosts routinely use self-signed/private-CA certs -> every segment rejected.
+# Flip the tls defaults to unverified (matches XMPlay's own networking).
+if grep -q '"Verify the peer certificate".*\.i64 = 1' "$FFSRC/libavformat/tls.h"; then
+	sed -i '/"Verify the peer certificate"/s/{ \.i64 = 1 }/{ .i64 = 0 }/' "$FFSRC/libavformat/tls.h"
+	echo "patched tls.h: verify/tls_verify default -> 0 (all nested fetches unverified)"
+fi
+
 # XP hardening beyond the main recipe: wchartocp() passes WC_ERR_INVALID_CHARS
 # (Vista+) to WideCharToMultiByte; XP rejects unknown flags for CP_UTF8, so the
 # wchar<->utf8 filename helpers would fail there. Force legacy conversion (0).
@@ -238,7 +248,7 @@ if grep -q 'WC_ERR_INVALID_CHARS' "$FFSRC/libavutil/wchar_filename.h"; then
 	echo "patched wchar_filename.h: WC_ERR_INVALID_CHARS -> 0 (XP-safe)"
 fi
 
-if [[ ! -f $PREFIX/.ffmpeg-xmp-config-v4 ]]; then
+if [[ ! -f $PREFIX/.ffmpeg-xmp-config-v5 ]]; then
 	log "generating component lists (all decoders incl. video)"
 	eval "$(python3 scripts/gen-component-lists.py "$FFSRC" | grep '^[A-Z]*=')"
 	log "decoders: $(tr ',' '\n' <<<"$ALLDECODERS" | wc -l), demuxers: $(tr ',' '\n' <<<"$DEMUXERS" | wc -l)"
@@ -271,7 +281,7 @@ if [[ ! -f $PREFIX/.ffmpeg-xmp-config-v4 ]]; then
 	( cd "$FFSRC" && make -j$JOBS && make install )
 	# config marker - bump the suffix whenever the configure options change so
 	# stale cached FFmpeg builds get rebuilt with the new configuration.
-	touch "$PREFIX/.ffmpeg-xmp-config-v4"
+	touch "$PREFIX/.ffmpeg-xmp-config-v5"
 fi
 
 log "done - FFmpeg libs in $PREFIX/lib"
