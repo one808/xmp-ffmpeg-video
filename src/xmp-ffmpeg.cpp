@@ -152,6 +152,21 @@ static void logmsg(const char *fmt, ...)
 	fclose(f);
 }
 
+// route FFmpeg's own log into ours - network/TLS failures then show up with
+// their real cause (403, handshake, DNS, ...)
+static void ff_log_cb(void *avcl, int level, const char *fmt, va_list vl)
+{
+	if (level > AV_LOG_INFO) return;
+	char dir[300];
+	if (!GetTempPathA(300, dir)) return;
+	strcat(dir, "xmp-ffmpeg-video.log");
+	FILE *f = fopen(dir, "a");
+	if (!f) return;
+	fputs("  ff: ", f);
+	vfprintf(f, fmt, vl);
+	fclose(f);
+}
+
 // ---------------------------------------------------------------- XMPFILE I/O
 
 static int io_read(void *opaque, uint8_t *buf, int size)
@@ -253,7 +268,16 @@ static FFMPEG *InitFF(const char *filename, XMPFILE file)
 		if (nfmt) {
 			nfmt->probesize = 32 * 1024 * 1024;
 			nfmt->max_analyze_duration = 10 * 1000000;
-			int nr = avformat_open_input(&nfmt, filename, NULL, NULL);
+			// CDNs frequently reject non-browser user agents (403 -> EIO)
+			AVDictionary *opts = NULL;
+			av_dict_set(&opts, "user_agent",
+				"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+				"(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", 0);
+			av_dict_set(&opts, "reconnect", "1", 0);
+			av_dict_set(&opts, "reconnect_streamed", "1", 0);
+			av_dict_set(&opts, "reconnect_delay_max", "5", 0);
+			int nr = avformat_open_input(&nfmt, filename, NULL, &opts);
+			av_dict_free(&opts);
 			if (nr >= 0) {
 				f->fmt = nfmt;
 				f->direct_net = TRUE;
@@ -1163,6 +1187,19 @@ extern "C" __declspec(dllexport) XMPIN *WINAPI XMPIN_GetInterface(DWORD face, In
 	InitializeCriticalSection(&video.lock);
 	video.ready = 0;
 	video.vframe = av_frame_alloc();
+	av_log_set_callback(ff_log_cb);
+	{
+		void *it = NULL;
+		const char *pn;
+		char plist[400] = "";
+		while ((pn = avio_enum_protocols(&it, 0))) {
+			if (strlen(plist) + strlen(pn) + 2 < sizeof(plist)) {
+				strcat(plist, pn);
+				strcat(plist, " ");
+			}
+		}
+		logmsg("=== plugin loaded, FFmpeg %s, protocols: %s", av_version_info(), plist);
+	}
 	return &xmpin;
 }
 
