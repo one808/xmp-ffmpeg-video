@@ -85,7 +85,7 @@ jobs:
         run: |
           VER=${{ steps.ver.outputs.ver }}
           RUN=${{ github.run_number }}
-          7z a "xmp-ffmpeg-video-$VER.zip" build/xmp-ffmpeg.dll README.md
+          7z a "xmp-ffmpeg-video-$VER.zip" build/xmp-ffmpeg.dll build/cacert.pem README.md
           # ADD-ONLY: never delete/modify existing releases. Tag = v<version>,
           # or v<version>.<run> when that version already has a release.
           TAG="v$VER"
