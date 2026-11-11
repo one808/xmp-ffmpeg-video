@@ -971,6 +971,7 @@ static char *WINAPI FF_GetTags()
 static void WINAPI FF_SetFormat(XMPFORMAT *form)
 {
 	FFMPEG *f = current;
+	if (!f) return;
 	form->rate = f->dec->sample_rate;
 	form->chan = f->dec->ch_layout.nb_channels;
 	form->res = res_code(f->dec->sample_fmt, f->dec->bits_per_raw_sample);
@@ -980,6 +981,7 @@ static void WINAPI FF_SetFormat(XMPFORMAT *form)
 static void WINAPI FF_GetInfoText(char *format, char *length)
 {
 	FFMPEG *f = current;
+	if (!f) return;
 	if (format) {
 		format += sprintf(format, "%s", f->codec ? f->codec : "?");
 		if (f->bitrate) format += sprintf(format, " - %ukb/s", (unsigned)f->bitrate);
@@ -990,6 +992,7 @@ static void WINAPI FF_GetInfoText(char *format, char *length)
 static void WINAPI FF_GetGeneralInfo(char *buf)
 {
 	FFMPEG *f = current;
+	if (!f) return;
 	const AVInputFormat *iformat = f->fmt->iformat;
 	buf += sprintf(buf, "Format\t%s\r", iformat && iformat->long_name ? iformat->long_name : "?");
 	buf += sprintf(buf, "Audio codec\t%s\r", f->codec ? f->codec : "?");
@@ -1003,6 +1006,7 @@ static void WINAPI FF_GetGeneralInfo(char *buf)
 static void WINAPI FF_GetMessage(char *buf)
 {
 	FFMPEG *f = current;
+	if (!f) return;
 	AVDictionary *md[2] = { f->fmt->streams[f->stream]->metadata, f->fmt->metadata };
 	for (int i = 0; i < 2; i++) {
 		AVDictionaryEntry *e = NULL;
@@ -1047,6 +1051,7 @@ static void video_late_scan(FFMPEG *f)
 static DWORD WINAPI FF_Process(float *buffer, DWORD count)
 {
 	FFMPEG *f = current;
+	if (!f) return 0;
 	video_late_scan(f);
 	if (video.active) video_clock_capture(xmpfstatus->GetTime());
 	DWORD done = 0;
@@ -1120,6 +1125,7 @@ static double WINAPI FF_GetGranularity()
 static double WINAPI FF_SetPosition(DWORD pos)
 {
 	FFMPEG *f = current;
+	if (!f) return -1;
 	double t = pos * 0.001;
 	if (!f->seekable) { logmsg("seek: not seekable (pos=%lu t=%.3f)", (unsigned long)pos, t); return -1; }
 
