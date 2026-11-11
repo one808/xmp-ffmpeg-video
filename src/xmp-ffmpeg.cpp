@@ -597,6 +597,14 @@ static void video_render_frame()
 static void video_tick()
 {
 	if (!video.active || video.hidden || !video.vdec) return;
+
+	// companion behavior: when XMPlay's window becomes the foreground window
+	// (clicked, restored from the taskbar, alt-tabbed to...), the video window
+	// rides along and shows itself on top - the pair behaves as one app.
+	if (xmpwin && GetForegroundWindow() == xmpwin)
+		SetWindowPos(video.hwnd, HWND_TOP, 0, 0, 0, 0,
+			SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+
 	double t = video_clock_now(); // interpolated playback clock
 	BOOL do_render = FALSE;
 
