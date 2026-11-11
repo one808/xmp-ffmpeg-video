@@ -188,6 +188,28 @@ if [[ ! -f $PREFIX/lib/libopencore-amrnb.a ]]; then
 	  && make -j$JOBS && make install )
 fi
 
+# mbedtls 3.6.7 - TLS backend for https (HLS/DASH over https). Same pin and
+# XP patches as our main XP FFmpeg builds (entropy via CryptGenRandom etc).
+fetch_git "https://github.com/Mbed-TLS/mbedtls.git" "$SRC/mbedtls_git" 627361b09e6f6e3eac756297a370a591cf310ab9
+if [[ ! -f $PREFIX/lib/libmbedtls.a ]]; then
+	log "building mbedtls"
+	(
+		cd "$SRC/mbedtls_git"
+		if [[ ! -d framework/.git ]]; then git submodule update --init framework; fi
+		if [[ ! -f .xp-patched ]]; then
+			patch -p1 < "$PATCHES/mbedtls-2.28.9_mingw-stdio.diff"
+			patch -p1 < "$PATCHES/mbedtls-3.6.7_winxp-compatible-entropy.diff"
+			touch .xp-patched
+		fi
+		mkdir -p build_dir && cd build_dir
+		env -u CFLAGS -u CXXFLAGS cmake .. -DCMAKE_SYSTEM_NAME=Windows -DCMAKE_C_COMPILER=$TRIPLE-gcc \
+			-DCMAKE_C_FLAGS="$CFLAGS -D__USE_MINGW_ANSI_STDIO=1" \
+			-DENABLE_PROGRAMS=0 -DENABLE_TESTING=0 -DENABLE_ZLIB_SUPPORT=1 \
+			-DCMAKE_INSTALL_PREFIX="$PREFIX"
+		make -j$JOBS && make install
+	)
+fi
+
 # ------------------------------------------------------------------- 3. FFmpeg
 FFVER=9.0.2
 FFSRC=$SRC/ffmpeg-$FFVER
@@ -216,7 +238,7 @@ if grep -q 'WC_ERR_INVALID_CHARS' "$FFSRC/libavutil/wchar_filename.h"; then
 	echo "patched wchar_filename.h: WC_ERR_INVALID_CHARS -> 0 (XP-safe)"
 fi
 
-if [[ ! -f $PREFIX/.ffmpeg-xmp-config-v3 ]]; then
+if [[ ! -f $PREFIX/.ffmpeg-xmp-config-v4 ]]; then
 	log "generating component lists (all decoders incl. video)"
 	eval "$(python3 scripts/gen-component-lists.py "$FFSRC" | grep '^[A-Z]*=')"
 	log "decoders: $(tr ',' '\n' <<<"$ALLDECODERS" | wc -l), demuxers: $(tr ',' '\n' <<<"$DEMUXERS" | wc -l)"
@@ -232,10 +254,10 @@ if [[ ! -f $PREFIX/.ffmpeg-xmp-config-v3 ]]; then
 		--enable-demuxer="$DEMUXERS" \
 		--enable-parser="$PARSERS" \
 		--enable-bsf="$BSFS" \
-		--enable-protocol=file \
+		--enable-protocol=file,http,https,tcp,tls,crypto,data,subfile \
 		--enable-libfdk-aac --enable-libcodec2 --enable-libopencore-amrnb \
 		--enable-libopencore-amrwb --enable-libgme \
-		--enable-zlib --enable-bzlib --enable-lzma \
+		--enable-zlib --enable-bzlib --enable-lzma --enable-mbedtls \
 		--enable-static --disable-shared \
 		--disable-avdevice --disable-avfilter \
 		--enable-swscale \
@@ -249,7 +271,7 @@ if [[ ! -f $PREFIX/.ffmpeg-xmp-config-v3 ]]; then
 	( cd "$FFSRC" && make -j$JOBS && make install )
 	# config marker - bump the suffix whenever the configure options change so
 	# stale cached FFmpeg builds get rebuilt with the new configuration.
-	touch "$PREFIX/.ffmpeg-xmp-config-v3"
+	touch "$PREFIX/.ffmpeg-xmp-config-v4"
 fi
 
 log "done - FFmpeg libs in $PREFIX/lib"

@@ -231,7 +231,9 @@ static FFMPEG *InitFF(const char *filename, XMPFILE file)
 	if (!f->fmt) goto fail;
 	f->fmt->pb = f->io;
 	f->fmt->flags |= AVFMT_FLAG_CUSTOM_IO;
-	if (avformat_open_input(&f->fmt, NULL, NULL, NULL) < 0) goto fail;
+	// pass the filename/URL: it is only a hint for our custom IO, but nested
+	// formats like HLS resolve their segment URLs against it (s->url)
+	if (avformat_open_input(&f->fmt, filename, NULL, NULL) < 0) goto fail;
 	if (avformat_find_stream_info(f->fmt, NULL) < 0) goto fail;
 
 	{ // pick the audio stream
