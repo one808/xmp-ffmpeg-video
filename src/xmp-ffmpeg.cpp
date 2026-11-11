@@ -760,6 +760,14 @@ static LRESULT CALLBACK video_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 		EndPaint(hwnd, &ps);
 		return 0;
 	}
+	case WM_ACTIVATE:
+		// owned-window z-order only guarantees WE sit above XMPlay - clicking
+		// us would leave XMPlay behind other apps' windows. Keep the owner
+		// visible right below us (without stealing focus).
+		if ((LOWORD)(wp) != 0 /* WA_INACTIVE */ && xmpwin)
+			SetWindowPos(xmpwin, video.hwnd, 0, 0, 0, 0,
+				SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+		break;
 	case WM_ERASEBKGND:
 		return 1;
 	case WM_APP_SHOW: {
