@@ -665,6 +665,32 @@ static void video_tick()
 
 // -- window
 
+// Find XMPlay's main window. MUST be a window of our own process: the owner
+// captured at plugin-load time can be ANY foreground window (e.g. Explorer),
+// which makes the video window follow the wrong "parent" in z-order.
+static BOOL CALLBACK enum_proc(HWND hwnd, LPARAM lp)
+{
+	DWORD pid = 0;
+	GetWindowThreadProcessId(hwnd, &pid);
+	if (pid == GetCurrentProcessId() && IsWindowVisible(hwnd) && !GetWindow(hwnd, 4 /* GW_OWNER */)
+		&& hwnd != video.hwnd) {
+		*(HWND*)lp = hwnd;
+		return FALSE;
+	}
+	return TRUE;
+}
+
+static HWND find_xmpwin()
+{
+	HWND fg = GetForegroundWindow();
+	DWORD pid = 0;
+	if (fg) GetWindowThreadProcessId(fg, &pid);
+	if (fg && pid == GetCurrentProcessId() && fg != video.hwnd) return fg;
+	HWND found = 0;
+	EnumWindows(enum_proc, (LPARAM)&found);
+	return found;
+}
+
 // Win11 rounds the corners of normal windows; our borderless style
 // (WM_NCCALCSIZE=0) loses that. Ask DWM for rounded corners via the API,
 // LOADED DYNAMICALLY - dwmapi.dll does not exist on XP and a dynamic load
@@ -847,6 +873,7 @@ static void video_show(FFMPEG *f)
 	video.show_w = w;
 	video.show_h = h;
 	video.hidden = FALSE;
+	xmpwin = find_xmpwin(); // owner must be XMPlay itself, not whatever had focus at load
 	PostMessage(video.hwnd, WM_APP_SHOW, 0, 0);
 }
 
@@ -1225,8 +1252,7 @@ extern "C" __declspec(dllexport) XMPIN *WINAPI XMPIN_GetInterface(DWORD face, In
 	xmpftext  = (XMPFUNC_TEXT*)faceproc(XMPFUNC_TEXT_FACE);
 	xmpfstatus = (XMPFUNC_STATUS*)faceproc(XMPFUNC_STATUS_FACE);
 	xmpver = xmpfmisc->GetVersion();
-	xmpwin = GetActiveWindow();
-	if (!xmpwin) xmpwin = GetForegroundWindow();
+	xmpwin = find_xmpwin(); // refreshed again at each show
 	InitializeCriticalSection(&video.lock);
 	video.ready = 0;
 	video.vframe = av_frame_alloc();
