@@ -197,8 +197,8 @@ if [[ ! -f $PREFIX/lib/libmbedtls.a ]]; then
 		cd "$SRC/mbedtls_git"
 		if [[ ! -d framework/.git ]]; then git submodule update --init framework; fi
 		if [[ ! -f .xp-patched ]]; then
-			patch -p1 < "$PATCHES/mbedtls-2.28.9_mingw-stdio.diff"
-			patch -p1 < "$PATCHES/mbedtls-3.6.7_winxp-compatible-entropy.diff"
+			patch -p0 < "$PATCHES/mbedtls-2.28.9_mingw-stdio.diff"
+			patch -p0 < "$PATCHES/mbedtls-3.6.7_winxp-compatible-entropy.diff"
 			touch .xp-patched
 		fi
 		mkdir -p build_dir && cd build_dir
