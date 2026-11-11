@@ -563,6 +563,22 @@ static void video_tick()
 
 // -- window
 
+// Win11 rounds the corners of normal windows; our borderless style
+// (WM_NCCALCSIZE=0) loses that. Ask DWM for rounded corners via the API,
+// LOADED DYNAMICALLY - dwmapi.dll does not exist on XP and a dynamic load
+// never shows up in the import table, so the XP audit stays clean.
+static void video_round_corners(HWND hwnd)
+{
+	typedef long (WINAPI *DwmSetWindowAttribute_t)(HWND, DWORD, const void *, DWORD);
+	HMODULE dwm = LoadLibraryA("dwmapi.dll");
+	if (!dwm) return;
+	DwmSetWindowAttribute_t pfn = (DwmSetWindowAttribute_t)GetProcAddress(dwm, "DwmSetWindowAttribute");
+	if (pfn) {
+		DWORD pref = 2; // DWMWCP_ROUND
+		pfn(hwnd, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */, &pref, sizeof(pref));
+	}
+}
+
 static void video_toggle_fullscreen()
 {
 	video.fullscreen = !video.fullscreen;
@@ -685,6 +701,7 @@ static DWORD WINAPI video_thread(LPVOID)
 		WS_POPUP | WS_THICKFRAME, CW_USEDEFAULT, CW_USEDEFAULT, 640, 480,
 		xmpwin, 0, wc.hInstance, 0); // owner = XMPlay main window
 	SetTimer(video.hwnd, 1, 15, 0);
+	video_round_corners(video.hwnd);
 	SetEvent(video.ready);
 
 	MSG msg;
@@ -777,9 +794,23 @@ static void WINAPI FF_About(HWND win)
 	MessageBox(win, msg, "About " PLUGIN_NAME, MB_ICONINFORMATION);
 }
 
+// Content check: XMPlay calls this for files it cannot route by extension
+// (and before opening) - we let avformat probe the actual data so anything
+// with a real audio/video stream is claimed regardless of its file name.
 static BOOL WINAPI FF_CheckFile(const char *filename, XMPFILE file)
 {
-	return TRUE;
+	unsigned char buf[65536];
+	DWORD n = xmpffile->Read(file, buf, sizeof(buf));
+	xmpffile->Seek(file, 0); // rewind - the file must be usable afterwards
+	if (n < 16) return FALSE;
+	AVProbeData pd;
+	memset(&pd, 0, sizeof(pd));
+	pd.filename = filename ? filename : "";
+	pd.buf = buf;
+	pd.buf_size = (int)n;
+	int score = 0;
+	const AVInputFormat *fmt = av_probe_input_format2(&pd, TRUE, &score);
+	return fmt && score >= 25; // AVPROBE_SCORE_RETRY
 }
 
 static DWORD WINAPI FF_GetFileInfo(const char *filename, XMPFILE file, float **length, char **tags)
@@ -967,7 +998,7 @@ static double WINAPI FF_SetPosition(DWORD pos)
 extern "C" __declspec(dllexport) XMPIN *WINAPI XMPIN_GetInterface(DWORD face, InterfaceProc faceproc)
 {
 	static XMPIN xmpin = {
-		XMPIN_FLAG_CANSTREAM | XMPIN_FLAG_NOCHECK | XMPIN_FLAG_MULTIEXT,
+		XMPIN_FLAG_CANSTREAM | XMPIN_FLAG_MULTIEXT,
 		"FFmpeg (audio+video)",
 		"FFmpeg audio\0"
 			"mp3/mp2/mp1/mpa/m4a/m4b/m4r/aac/ac3/eac3/dts/dtshd/hra/mlp/truehd/thd/"
