@@ -399,10 +399,10 @@ static FFMPEG *InitFF(const char *filename, XMPFILE file)
 
 	{ // length + bitrate
 		AVStream *st = f->fmt->streams[f->stream];
-		if (st->duration != AV_NOPTS_VALUE && st->duration > 0)
-			f->duration = st->duration * av_q2d(st->time_base);
-		else if (f->fmt->duration != AV_NOPTS_VALUE && f->fmt->duration > 0)
+		if (f->fmt->duration != AV_NOPTS_VALUE && f->fmt->duration > 0)
 			f->duration = (double)f->fmt->duration / AV_TIME_BASE;
+		else if (st->duration != AV_NOPTS_VALUE && st->duration > 0)
+			f->duration = st->duration * av_q2d(st->time_base);
 		QWORD br = st->codecpar->bit_rate ? st->codecpar->bit_rate : f->fmt->bit_rate;
 		f->bitrate = (DWORD)(br / 1000);
 	}
@@ -940,7 +940,8 @@ static DWORD WINAPI FF_Open(const char *filename, XMPFILE file)
 	current->recheck = 1; // first late-scan on the first Process call
 	if (current->direct_net) current->seekable = TRUE;
 	video_clock_capture(0);
-	logmsg("OPEN: vstream=%d audio=%s", current->vstream, current->codec ? current->codec : "?");
+	logmsg("OPEN: vstream=%d audio=%s dur=%.3f seekable=%d", current->vstream,
+		current->codec ? current->codec : "?", current->duration, current->seekable);
 	xmpfin->SetLength((float)(current->duration > 0 ? current->duration : -1), current->seekable);
 	if (current->netfile)
 		xmpffile->NetSetRate(file, current->bitrate ? current->bitrate * 125 : 32000);
@@ -1120,7 +1121,7 @@ static double WINAPI FF_SetPosition(DWORD pos)
 {
 	FFMPEG *f = current;
 	double t = pos * 0.001;
-	if (!f->seekable) { logmsg("seek: not seekable (t=%.2f)", t); return -1; }
+	if (!f->seekable) { logmsg("seek: not seekable (pos=%lu t=%.3f)", (unsigned long)pos, t); return -1; }
 
 	// three strategies, in order; HLS is picky about which form it accepts
 	int r = av_seek_frame(f->fmt, -1, (int64_t)(t * AV_TIME_BASE), AVSEEK_FLAG_BACKWARD);
@@ -1137,10 +1138,10 @@ static double WINAPI FF_SetPosition(DWORD pos)
 		logmsg("seek: seek_file retry -> %d (t=%.2f)", r, t);
 	}
 	if (r < 0) {
-		logmsg("seek: FAILED all strategies (t=%.2f)", t);
+		logmsg("seek: FAILED all strategies (pos=%lu t=%.3f)", (unsigned long)pos, t);
 		return -1;
 	}
-	logmsg("seek: ok t=%.2f", t);
+	logmsg("seek: ok pos=%lu t=%.3f", (unsigned long)pos, t);
 
 	avcodec_flush_buffers(f->dec);
 	swr_init(f->swr); // drop any resampler delay
