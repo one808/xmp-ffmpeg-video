@@ -71,6 +71,7 @@ struct FFMPEG {
 	DWORD outcap;        // capacity in floats
 	DWORD outlen, outp;  // floats valid / consumed
 	int recheck;         // lazy video discovery countdown
+	BOOL direct_net;     // opened over the network by FFmpeg itself
 	const char *codec;   // audio codec short name
 	int vw, vh;
 	const char *video_codec;
@@ -192,7 +193,7 @@ static void FreeFF(FFMPEG *f)
 	if (f->dec) avcodec_free_context(&f->dec);
 	if (f->vdec) avcodec_free_context(&f->vdec);
 	if (f->fmt) avformat_close_input(&f->fmt); // CUSTOM_IO: does not free our AVIO
-	if (f->io) {
+	if (f->io) { // (absent in direct-net mode - close_input freed everything)
 		// avio_context_free does NOT free the IO buffer - and avio may have
 		// reallocated it, so free io->buffer (per the official avio_read_callback
 		// example). Without this, every file open/close leaks 64KB.
@@ -242,30 +243,55 @@ static FFMPEG *InitFF(const char *filename, XMPFILE file)
 	f->seekable = (type != XMPFILE_TYPE_NETSTREAM);
 	f->netfile = (type >= XMPFILE_TYPE_NETFILE);
 
-	const int IOBUF = 64 * 1024;
-	unsigned char *iobuf = (unsigned char*)av_malloc(IOBUF);
-	f->io = avio_alloc_context(iobuf, IOBUF, 0, f, io_read, NULL, f->seekable ? io_seek : NULL);
-	if (!f->io) { av_free(iobuf); free(f); return 0; }
-	f->io->seekable = f->seekable ? AVIO_SEEKABLE_NORMAL : 0;
+	// For URLs let FFmpeg fetch them with its own networking stack. XMPlay's
+	// net layer resolves playlists like m3u8 down to the AUDIO stream before
+	// handing them over (it is an audio player), which hides the video track
+	// completely - opening the URL directly keeps every stream. Fall back to
+	// the XMPFILE custom IO when that fails.
+	if (filename && strstr(filename, "://")) {
+		AVFormatContext *nfmt = avformat_alloc_context();
+		if (nfmt) {
+			nfmt->probesize = 32 * 1024 * 1024;
+			nfmt->max_analyze_duration = 10 * 1000000;
+			int nr = avformat_open_input(&nfmt, filename, NULL, NULL);
+			if (nr >= 0) {
+				f->fmt = nfmt;
+				f->direct_net = TRUE;
+				logmsg("direct-net open ok: format=%s file=%s",
+					nfmt->iformat ? nfmt->iformat->name : "?", filename);
+			} else {
+				avformat_free_context(nfmt);
+				logmsg("direct-net open failed %d, using XMPFILE layer", nr);
+			}
+		}
+	}
 
-	f->fmt = avformat_alloc_context();
-	if (!f->fmt) goto fail;
-	f->fmt->pb = f->io;
-	f->fmt->flags |= AVFMT_FLAG_CUSTOM_IO;
+	const int IOBUF = 64 * 1024;
+	if (!f->fmt) {
+		unsigned char *iobuf = (unsigned char*)av_malloc(IOBUF);
+		f->io = avio_alloc_context(iobuf, IOBUF, 0, f, io_read, NULL, f->seekable ? io_seek : NULL);
+		if (!f->io) { av_free(iobuf); free(f); return 0; }
+		f->io->seekable = f->seekable ? AVIO_SEEKABLE_NORMAL : 0;
+
+		f->fmt = avformat_alloc_context();
+		if (!f->fmt) goto fail;
+		f->fmt->pb = f->io;
+		f->fmt->flags |= AVFMT_FLAG_CUSTOM_IO;
+	}
 	// pass the filename/URL: it is only a hint for our custom IO, but nested
 	// formats like HLS resolve their segment URLs against it (s->url)
 	f->fmt->probesize = 32 * 1024 * 1024;      // stubborn streams (TS/HLS)
 	f->fmt->max_analyze_duration = 10 * 1000000;
 	// pass the filename/URL: it is only a hint for our custom IO, but nested
 	// formats like HLS resolve their segment URLs against it (s->url)
-	{
+	if (!f->direct_net) {
 		int ior = avformat_open_input(&f->fmt, filename, NULL, NULL);
 		if (ior < 0) {
 			logmsg("open_input FAILED %d file=%s", ior, filename ? filename : "?");
 			goto fail;
 		}
 	}
-	logmsg("open_input ok: format=%s streams=%u file=%s",
+	logmsg("open ok: format=%s streams=%u file=%s",
 		f->fmt->iformat ? f->fmt->iformat->name : "?", f->fmt->nb_streams, filename ? filename : "?");
 	if (avformat_find_stream_info(f->fmt, NULL) < 0) logmsg("find_stream_info failed (continuing)");
 	for (unsigned li = 0; li < f->fmt->nb_streams; li++) {
@@ -882,6 +908,7 @@ static DWORD WINAPI FF_Open(const char *filename, XMPFILE file)
 	if (!current) return 0;
 	current->pos = 0;
 	current->recheck = 1; // first late-scan on the first Process call
+	if (current->direct_net) current->seekable = TRUE;
 	video_clock_capture(0);
 	logmsg("OPEN: vstream=%d audio=%s", current->vstream, current->codec ? current->codec : "?");
 	xmpfin->SetLength((float)(current->duration > 0 ? current->duration : -1), current->seekable);
