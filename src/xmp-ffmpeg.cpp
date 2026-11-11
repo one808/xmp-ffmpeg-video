@@ -1138,10 +1138,12 @@ static double WINAPI FF_SetPosition(DWORD pos)
 		logmsg("seek: seek_file retry -> %d (t=%.2f)", r, t);
 	}
 	if (r < 0) {
-		logmsg("seek: FAILED all strategies (pos=%lu t=%.3f)", (unsigned long)pos, t);
+		logmsg("seek: FAILED all strategies (pos=%lu t=%.3f, xmp-now=%.3f)", (unsigned long)pos, t,
+			xmpfstatus ? xmpfstatus->GetTime() : -999.0);
 		return -1;
 	}
-	logmsg("seek: ok pos=%lu t=%.3f", (unsigned long)pos, t);
+	logmsg("seek: ok pos=%lu t=%.3f (gran=%.3f, xmp-now=%.3f)", (unsigned long)pos, t,
+			FF_GetGranularity(), xmpfstatus ? xmpfstatus->GetTime() : -999.0);
 
 	avcodec_flush_buffers(f->dec);
 	swr_init(f->swr); // drop any resampler delay
@@ -1225,7 +1227,9 @@ extern "C" __declspec(dllexport) XMPIN *WINAPI XMPIN_GetInterface(DWORD face, In
 				strcat(plist, " ");
 			}
 		}
-		logmsg("=== plugin loaded, FFmpeg %s, protocols: %s", av_version_info(), plist);
+		logmsg("=== plugin loaded: %s %s | flags=0x%lx | FFmpeg %s | protocols: %s",
+			PLUGIN_NAME, PLUGIN_VER, (unsigned long)(XMPIN_FLAG_CANSTREAM | XMPIN_FLAG_MULTIEXT | XMPIN_FLAG_NETSEEK),
+			av_version_info(), plist);
 	}
 	return &xmpin;
 }
