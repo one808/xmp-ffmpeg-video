@@ -258,62 +258,20 @@ static FFMPEG *InitFF(const char *filename, XMPFILE file)
 	f->seekable = (type != XMPFILE_TYPE_NETSTREAM);
 	f->netfile = (type >= XMPFILE_TYPE_NETFILE);
 
-	// For URLs let FFmpeg fetch them with its own networking stack. XMPlay's
-	// net layer resolves playlists like m3u8 down to the AUDIO stream before
-	// handing them over (it is an audio player), which hides the video track
-	// completely - opening the URL directly keeps every stream. Fall back to
-	// the XMPFILE custom IO when that fails.
-	if (filename && strstr(filename, "://")) {
-		AVFormatContext *nfmt = avformat_alloc_context();
-		if (nfmt) {
-			nfmt->probesize = 32 * 1024 * 1024;
-			nfmt->max_analyze_duration = 10 * 1000000;
-			AVDictionary *opts = NULL;
-			av_dict_set(&opts, "user_agent",
-				"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-				"(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", 0);
-			av_dict_set(&opts, "reconnect", "1", 0);
-			av_dict_set(&opts, "reconnect_streamed", "1", 0);
-			av_dict_set(&opts, "reconnect_delay_max", "5", 0);
-			// No certificate verification: HLS segment hosts routinely use
-			// self-signed/private-CA certs (mbedtls would reject every one of
-			// them - the earlier 'segment failed, skipping' storm). Same
-			// policy XMPlay's own networking uses. These options are
-			// inherited by every nested segment fetch.
-			av_dict_set(&opts, "verify", "0", 0);
-			av_dict_set(&opts, "tls_verify", "0", 0);
-			int nr = avformat_open_input(&nfmt, filename, NULL, &opts);
-			av_dict_free(&opts);
-			if (nr >= 0) {
-				f->fmt = nfmt;
-				f->direct_net = TRUE;
-				logmsg("direct-net open ok: format=%s file=%s",
-					nfmt->iformat ? nfmt->iformat->name : "?", filename);
-			} else {
-				logmsg("direct-net failed %d, using XMPFILE layer", nr);
-			}
-		}
-	}
+	// NOXMPFILE mode: all I/O goes through FFmpeg itself - for local paths and
+	// URLs alike. No XMPlay file layer means no "netstream" semantics: seeks
+	// reach us as real target positions, like local files.
+	if (!filename || !*filename) { free(f); return 0; }
+	f->fmt = avformat_alloc_context();
+	if (!f->fmt) goto fail;
+	f->direct_net = (strstr(filename, "://") != NULL);
+	f->seekable = TRUE;
 
-	const int IOBUF = 64 * 1024;
-	if (!f->fmt) {
-		unsigned char *iobuf = (unsigned char*)av_malloc(IOBUF);
-		f->io = avio_alloc_context(iobuf, IOBUF, 0, f, io_read, NULL, f->seekable ? io_seek : NULL);
-		if (!f->io) { av_free(iobuf); free(f); return 0; }
-		f->io->seekable = f->seekable ? AVIO_SEEKABLE_NORMAL : 0;
-
-		f->fmt = avformat_alloc_context();
-		if (!f->fmt) goto fail;
-		f->fmt->pb = f->io;
-		f->fmt->flags |= AVFMT_FLAG_CUSTOM_IO;
-	}
-	// pass the filename/URL: it is only a hint for our custom IO, but nested
-	// formats like HLS resolve their segment URLs against it (s->url)
 	f->fmt->probesize = 32 * 1024 * 1024;      // stubborn streams (TS/HLS)
 	f->fmt->max_analyze_duration = 10 * 1000000;
 	// pass the filename/URL: it is only a hint for our custom IO, but nested
 	// formats like HLS resolve their segment URLs against it (s->url)
-	if (!f->direct_net) {
+	{
 		int ior = avformat_open_input(&f->fmt, filename, NULL, NULL);
 		if (ior < 0) {
 			logmsg("open_input FAILED %d file=%s", ior, filename ? filename : "?");
@@ -901,6 +859,7 @@ static void WINAPI FF_About(HWND win)
 // with a real audio/video stream is claimed regardless of its file name.
 static BOOL WINAPI FF_CheckFile(const char *filename, XMPFILE file)
 {
+	if (!file) return TRUE; // NOXMPFILE: nothing to read here, let Open decide
 	unsigned char buf[65536];
 	DWORD n = xmpffile->Read(file, buf, sizeof(buf));
 	xmpffile->Seek(file, 0); // rewind - the file must be usable afterwards
@@ -938,7 +897,6 @@ static DWORD WINAPI FF_Open(const char *filename, XMPFILE file)
 	if (!current) return 0;
 	current->pos = 0;
 	current->recheck = 1; // first late-scan on the first Process call
-	if (current->direct_net) current->seekable = TRUE;
 	video_clock_capture(0);
 	logmsg("OPEN: vstream=%d audio=%s dur=%.3f seekable=%d", current->vstream,
 		current->codec ? current->codec : "?", current->duration, current->seekable);
@@ -1161,7 +1119,7 @@ static double WINAPI FF_SetPosition(DWORD pos)
 extern "C" __declspec(dllexport) XMPIN *WINAPI XMPIN_GetInterface(DWORD face, InterfaceProc faceproc)
 {
 	static XMPIN xmpin = {
-		XMPIN_FLAG_CANSTREAM | XMPIN_FLAG_MULTIEXT | XMPIN_FLAG_NETSEEK,
+		XMPIN_FLAG_CANSTREAM | XMPIN_FLAG_MULTIEXT | XMPIN_FLAG_NETSEEK | XMPIN_FLAG_NOXMPFILE,
 		"FFmpeg (audio+video)",
 		"FFmpeg audio\0"
 			"mp3/mp2/mp1/mpa/m4a/m4b/m4r/aac/ac3/eac3/dts/dtshd/hra/mlp/truehd/thd/"
@@ -1228,7 +1186,7 @@ extern "C" __declspec(dllexport) XMPIN *WINAPI XMPIN_GetInterface(DWORD face, In
 			}
 		}
 		logmsg("=== plugin loaded: %s %s | flags=0x%lx | FFmpeg %s | protocols: %s",
-			PLUGIN_NAME, PLUGIN_VER, (unsigned long)(XMPIN_FLAG_CANSTREAM | XMPIN_FLAG_MULTIEXT | XMPIN_FLAG_NETSEEK),
+			PLUGIN_NAME, PLUGIN_VER, (unsigned long)(XMPIN_FLAG_CANSTREAM | XMPIN_FLAG_MULTIEXT | XMPIN_FLAG_NETSEEK | XMPIN_FLAG_NOXMPFILE),
 			av_version_info(), plist);
 	}
 	return &xmpin;
