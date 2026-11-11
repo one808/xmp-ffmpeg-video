@@ -36,7 +36,7 @@ Built for **Windows XP and later** (including old CPUs without SSE2).
 
 ## Installation
 
-Copy `xmp-ffmpeg.dll` (and `cacert.pem`, for verified TLS on network streams) into XMPlay's folder (or its `plugins` folder) and
+Copy `xmp-ffmpeg.dll` into XMPlay's folder (or its `plugins` folder) and
 restart XMPlay. If you previously had the audio-only `xmp-ffmpeg.dll`, this
 one replaces it.
 

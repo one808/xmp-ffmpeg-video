@@ -50,7 +50,6 @@ static XMPFUNC_TEXT   *xmpftext;
 static XMPFUNC_STATUS *xmpfstatus;
 static DWORD xmpver;
 static HWND xmpwin; // XMPlay's main window - owner of the video window
-static HMODULE ghmod;
 
 struct FFMPEG {
 	XMPFILE file;
@@ -168,22 +167,6 @@ static void ff_log_cb(void *avcl, int level, const char *fmt, va_list vl)
 	fclose(f);
 }
 
-// The bundled CA bundle (cacert.pem next to the DLL) enables verified TLS;
-// without it mbedtls has no trusted roots at all (it does not use the Windows
-// certificate store) and every https host fails certificate verification.
-static BOOL find_ca(char *out)
-{
-	if (!GetModuleFileNameA(ghmod, out, 300)) return FALSE;
-	char *sl = strrchr(out, '\\');
-	if (!sl) return FALSE;
-	sl[1] = 0;
-	strcat(out, "cacert.pem");
-	FILE *f = fopen(out, "r");
-	if (!f) return FALSE;
-	fclose(f);
-	return TRUE;
-}
-
 // ---------------------------------------------------------------- XMPFILE I/O
 
 static int io_read(void *opaque, uint8_t *buf, int size)
@@ -281,13 +264,8 @@ static FFMPEG *InitFF(const char *filename, XMPFILE file)
 	// completely - opening the URL directly keeps every stream. Fall back to
 	// the XMPFILE custom IO when that fails.
 	if (filename && strstr(filename, "://")) {
-		char capath[300];
-		BOOL haveca = find_ca(capath);
-		// attempt 0: TLS with certificate verification against the bundled
-		// CA store; attempt 1: unverified (media streams, no CA available)
-		for (int attempt = (haveca ? 0 : 1); attempt < 2 && !f->fmt; attempt++) {
-			AVFormatContext *nfmt = avformat_alloc_context();
-			if (!nfmt) break;
+		AVFormatContext *nfmt = avformat_alloc_context();
+		if (nfmt) {
 			nfmt->probesize = 32 * 1024 * 1024;
 			nfmt->max_analyze_duration = 10 * 1000000;
 			AVDictionary *opts = NULL;
@@ -297,25 +275,24 @@ static FFMPEG *InitFF(const char *filename, XMPFILE file)
 			av_dict_set(&opts, "reconnect", "1", 0);
 			av_dict_set(&opts, "reconnect_streamed", "1", 0);
 			av_dict_set(&opts, "reconnect_delay_max", "5", 0);
-			if (attempt == 0) {
-				av_dict_set(&opts, "ca_file", capath, 0);
-			} else {
-				av_dict_set(&opts, "verify", "0", 0);
-				av_dict_set(&opts, "tls_verify", "0", 0);
-				logmsg("direct-net retry without certificate verification");
-			}
+			// No certificate verification: HLS segment hosts routinely use
+			// self-signed/private-CA certs (mbedtls would reject every one of
+			// them - the earlier 'segment failed, skipping' storm). Same
+			// policy XMPlay's own networking uses. These options are
+			// inherited by every nested segment fetch.
+			av_dict_set(&opts, "verify", "0", 0);
+			av_dict_set(&opts, "tls_verify", "0", 0);
 			int nr = avformat_open_input(&nfmt, filename, NULL, &opts);
 			av_dict_free(&opts);
 			if (nr >= 0) {
 				f->fmt = nfmt;
 				f->direct_net = TRUE;
-				logmsg("direct-net open ok (attempt %d, ca=%d): format=%s file=%s",
-					attempt, haveca, nfmt->iformat ? nfmt->iformat->name : "?", filename);
+				logmsg("direct-net open ok: format=%s file=%s",
+					nfmt->iformat ? nfmt->iformat->name : "?", filename);
 			} else {
-				logmsg("direct-net attempt %d failed %d", attempt, nr);
+				logmsg("direct-net failed %d, using XMPFILE layer", nr);
 			}
 		}
-		if (!f->fmt) logmsg("direct-net failed, using XMPFILE layer");
 	}
 
 	const int IOBUF = 64 * 1024;
@@ -1237,7 +1214,6 @@ BOOL WINAPI DllMain(HINSTANCE hDLL, DWORD reason, LPVOID reserved)
 	switch (reason) {
 	case DLL_PROCESS_ATTACH:
 		DisableThreadLibraryCalls(hDLL);
-		ghmod = hDLL;
 		break;
 	}
 	return TRUE;

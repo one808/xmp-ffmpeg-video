@@ -63,11 +63,6 @@ if ! $TRIPLE-objdump -p build/xmp-ffmpeg.dll | grep -qw "XMPIN_GetInterface"; th
 fi
 echo "export check: XMPIN_GetInterface OK"
 
-# bundle Mozilla's CA store next to the DLL (verified TLS); the plugin falls
-# back to unverified connections when this file is missing
-curl -sL --max-time 60 https://curl.se/ca/cacert.pem -o build/cacert.pem \
-	&& echo "cacert.pem bundled ($(wc -c < build/cacert.pem) bytes)" \
-	|| echo "WARNING: cacert.pem download failed - TLS will run unverified"
 
 $TRIPLE-strip --strip-unneeded build/xmp-ffmpeg.dll
 ls -la build/xmp-ffmpeg.dll
