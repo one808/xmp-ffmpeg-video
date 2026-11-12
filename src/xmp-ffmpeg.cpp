@@ -265,7 +265,7 @@ static FFMPEG *InitFF(const char *filename, XMPFILE file)
 	// handing them over (it is an audio player), which hides the video track
 	// completely - opening the URL directly keeps every stream. Fall back to
 	// the XMPFILE custom IO when that fails.
-	if (filename && strstr(filename, "://")) {
+	if (!file || (filename && strstr(filename, "://"))) {
 		AVFormatContext *nfmt = avformat_alloc_context();
 		if (nfmt) {
 			nfmt->probesize = 32 * 1024 * 1024;
@@ -296,8 +296,8 @@ static FFMPEG *InitFF(const char *filename, XMPFILE file)
 			}
 		}
 	}
-
 	const int IOBUF = 64 * 1024;
+	if (!f->fmt && !file) { logmsg("open: no XMPFILE and direct open failed"); goto fail; }
 	if (!f->fmt) {
 		unsigned char *iobuf = (unsigned char*)av_malloc(IOBUF);
 		f->io = avio_alloc_context(iobuf, IOBUF, 0, f, io_read, NULL, f->seekable ? io_seek : NULL);
@@ -938,8 +938,8 @@ static void video_detach()
 
 static void WINAPI FF_About(HWND win)
 {
-	char msg[256];
-	sprintf(msg, "%s %s\n\nPlays any audio format FFmpeg can decode,\n"
+	char msg[512];
+	snprintf(msg, sizeof(msg), "%s %s\n\nPlays any audio format FFmpeg can decode,\n"
 		"including the audio stream of video files,\n"
 		"with an automatic borderless video window.\n\n"
 		"Video window: drag to move, drag edges to resize,\n"
@@ -1006,7 +1006,10 @@ static DWORD WINAPI FF_Open(const char *filename, XMPFILE file)
 		video.title[sizeof(video.title) - 1] = 0;
 	}
 	video_attach(current); // shows the window iff this file has video
-	return 1;
+	// 2 = success and XMPlay may close its file: we did the I/O ourselves
+	// (direct networking / no XMPFILE). This is what makes XMPlay forward
+	// real seek positions for internet streams (Ian @ un4seen).
+	return (current->direct_net || !file) ? 2 : 1;
 }
 
 static void WINAPI FF_Close()
@@ -1220,7 +1223,7 @@ static double WINAPI FF_SetPosition(DWORD pos)
 extern "C" __declspec(dllexport) XMPIN *WINAPI XMPIN_GetInterface(DWORD face, InterfaceProc faceproc)
 {
 	static XMPIN xmpin = {
-		XMPIN_FLAG_CANSTREAM | XMPIN_FLAG_MULTIEXT | XMPIN_FLAG_NETSEEK,
+		XMPIN_FLAG_CANSTREAM | XMPIN_FLAG_MULTIEXT | XMPIN_FLAG_NETSEEK | XMPIN_FLAG_OWNFILE,
 		"FFmpeg (audio+video)",
 		"FFmpeg audio\0"
 			"mp3/mp2/mp1/mpa/m4a/m4b/m4r/aac/ac3/eac3/dts/dtshd/hra/mlp/truehd/thd/"
@@ -1286,7 +1289,7 @@ extern "C" __declspec(dllexport) XMPIN *WINAPI XMPIN_GetInterface(DWORD face, In
 			}
 		}
 		logmsg("=== plugin loaded: %s %s | flags=0x%lx | FFmpeg %s | protocols: %s",
-			PLUGIN_NAME, PLUGIN_VER, (unsigned long)(XMPIN_FLAG_CANSTREAM | XMPIN_FLAG_MULTIEXT | XMPIN_FLAG_NETSEEK),
+			PLUGIN_NAME, PLUGIN_VER, (unsigned long)(XMPIN_FLAG_CANSTREAM | XMPIN_FLAG_MULTIEXT | XMPIN_FLAG_NETSEEK | XMPIN_FLAG_OWNFILE),
 			av_version_info(), plist);
 	}
 	return &xmpin;
