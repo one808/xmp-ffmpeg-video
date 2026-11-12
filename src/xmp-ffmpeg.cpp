@@ -1009,10 +1009,10 @@ static DWORD WINAPI FF_Open(const char *filename, XMPFILE file)
 		video.title[sizeof(video.title) - 1] = 0;
 	}
 	video_attach(current); // shows the window iff this file has video
-	// 2 = success and XMPlay may close its file: we did the I/O ourselves
-	// (direct networking / no XMPFILE). This is what makes XMPlay forward
-	// real seek positions for internet streams (Ian @ un4seen).
-	return (current->direct_net || !file) ? 2 : 1;
+	// NOTE: returning 2 (own file routines, per Ian's suggestion) made XMPlay
+	// crash instantly on seek-bar clicks for internet streams - before ever
+	// calling SetPosition. Reverted to 1 (stable); the case is back with Ian.
+	return 1;
 }
 
 static void WINAPI FF_Close()
@@ -1253,7 +1253,7 @@ static double WINAPI FF_SetPosition(DWORD pos)
 extern "C" __declspec(dllexport) XMPIN *WINAPI XMPIN_GetInterface(DWORD face, InterfaceProc faceproc)
 {
 	static XMPIN xmpin = {
-		XMPIN_FLAG_CANSTREAM | XMPIN_FLAG_MULTIEXT | XMPIN_FLAG_NETSEEK | XMPIN_FLAG_OWNFILE,
+		XMPIN_FLAG_CANSTREAM | XMPIN_FLAG_MULTIEXT | XMPIN_FLAG_NETSEEK,
 		"FFmpeg (audio+video)",
 		"FFmpeg audio\0"
 			"mp3/mp2/mp1/mpa/m4a/m4b/m4r/aac/ac3/eac3/dts/dtshd/hra/mlp/truehd/thd/"
@@ -1320,7 +1320,7 @@ extern "C" __declspec(dllexport) XMPIN *WINAPI XMPIN_GetInterface(DWORD face, In
 			}
 		}
 		logmsg("=== plugin loaded: %s %s | flags=0x%lx | FFmpeg %s | protocols: %s",
-			PLUGIN_NAME, PLUGIN_VER, (unsigned long)(XMPIN_FLAG_CANSTREAM | XMPIN_FLAG_MULTIEXT | XMPIN_FLAG_NETSEEK | XMPIN_FLAG_OWNFILE),
+			PLUGIN_NAME, PLUGIN_VER, (unsigned long)(XMPIN_FLAG_CANSTREAM | XMPIN_FLAG_MULTIEXT | XMPIN_FLAG_NETSEEK),
 			av_version_info(), plist);
 	}
 	return &xmpin;
