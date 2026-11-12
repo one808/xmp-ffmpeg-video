@@ -77,6 +77,7 @@ struct FFMPEG {
 	const char *video_codec;
 };
 static FFMPEG *current;
+static CRITICAL_SECTION demux_lock; // guards av_read_frame/av_seek_frame/send
 
 // --------------------------------------------------------------- video state
 
@@ -1015,8 +1016,11 @@ static DWORD WINAPI FF_Open(const char *filename, XMPFILE file)
 static void WINAPI FF_Close()
 {
 	video_detach(); // stop the render thread before freeing the video decoder
-	FreeFF(current);
+	EnterCriticalSection(&demux_lock);
+	FFMPEG *f = current;
 	current = 0;
+	LeaveCriticalSection(&demux_lock);
+	FreeFF(f);
 }
 
 static char *WINAPI FF_GetTags()
@@ -1110,6 +1114,7 @@ static DWORD WINAPI FF_Process(float *buffer, DWORD count)
 	if (!f) return 0;
 	video_late_scan(f);
 	if (video.active) video_clock_capture(xmpfstatus->GetTime());
+	EnterCriticalSection(&demux_lock);
 	DWORD done = 0;
 	int ch = f->dec->ch_layout.nb_channels;
 	if (ch < 1) ch = 1;
@@ -1170,6 +1175,7 @@ static DWORD WINAPI FF_Process(float *buffer, DWORD count)
 		LeaveCriticalSection(&video.lock);
 		avcodec_send_packet(f->dec, NULL); // end of input: drain the decoder
 	}
+	LeaveCriticalSection(&demux_lock);
 	return done;
 }
 
@@ -1183,7 +1189,9 @@ static double WINAPI FF_SetPosition(DWORD pos)
 	FFMPEG *f = current;
 	if (!f) return -1;
 	double t = pos * 0.001;
+	logmsg("seek: begin pos=%lu t=%.3f", (unsigned long)pos, t);
 	if (!f->seekable) { logmsg("seek: not seekable (pos=%lu t=%.3f)", (unsigned long)pos, t); return -1; }
+	EnterCriticalSection(&demux_lock);
 
 	// three strategies, in order; HLS is picky about which form it accepts
 	int r = av_seek_frame(f->fmt, -1, (int64_t)(t * AV_TIME_BASE), AVSEEK_FLAG_BACKWARD);
@@ -1200,6 +1208,7 @@ static double WINAPI FF_SetPosition(DWORD pos)
 		logmsg("seek: seek_file retry -> %d (t=%.2f)", r, t);
 	}
 	if (r < 0) {
+		LeaveCriticalSection(&demux_lock);
 		logmsg("seek: FAILED all strategies (pos=%lu t=%.3f, xmp-now=%.3f)", (unsigned long)pos, t,
 			xmpfstatus ? xmpfstatus->GetTime() : -999.0);
 		return -1;
@@ -1212,6 +1221,7 @@ static double WINAPI FF_SetPosition(DWORD pos)
 	f->outlen = f->outp = 0;
 	f->eof = f->sent_eof = FALSE;
 	f->demux_eof = FALSE;
+	LeaveCriticalSection(&demux_lock);
 	video_flush(); // reposition the video too
 	video_clock_capture(t);
 	f->pos = t;
@@ -1275,6 +1285,7 @@ extern "C" __declspec(dllexport) XMPIN *WINAPI XMPIN_GetInterface(DWORD face, In
 	xmpver = xmpfmisc->GetVersion();
 	xmpwin = find_xmpwin(); // refreshed again at each show
 	InitializeCriticalSection(&video.lock);
+	InitializeCriticalSection(&demux_lock);
 	video.ready = 0;
 	video.vframe = av_frame_alloc();
 	av_log_set_callback(ff_log_cb);
