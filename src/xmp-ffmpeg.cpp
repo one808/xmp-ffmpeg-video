@@ -972,6 +972,7 @@ static BOOL WINAPI FF_CheckFile(const char *filename, XMPFILE file)
 
 static DWORD WINAPI FF_GetFileInfo(const char *filename, XMPFILE file, float **length, char **tags)
 {
+	logmsg("cb: GetFileInfo(%s)", filename ? filename : "(null)");
 	FFMPEG *f = InitFF(filename, file);
 	if (!f) return 0;
 	if (length && f->duration > 0) {
@@ -988,6 +989,7 @@ static DWORD WINAPI FF_GetFileInfo(const char *filename, XMPFILE file, float **l
 
 static DWORD WINAPI FF_Open(const char *filename, XMPFILE file)
 {
+	logmsg("cb: Open(%s, file=%p)", filename ? filename : "(null)", (void*)file);
 	current = InitFF(filename, file);
 	if (!current) return 0;
 	current->pos = 0;
@@ -1015,6 +1017,7 @@ static DWORD WINAPI FF_Open(const char *filename, XMPFILE file)
 
 static void WINAPI FF_Close()
 {
+	logmsg("cb: Close");
 	video_detach(); // stop the render thread before freeing the video decoder
 	EnterCriticalSection(&demux_lock);
 	FFMPEG *f = current;
@@ -1025,11 +1028,17 @@ static void WINAPI FF_Close()
 
 static char *WINAPI FF_GetTags()
 {
-	return current ? BuildTags(current) : NULL;
+	logmsg("cb: GetTags");
+	EnterCriticalSection(&demux_lock);
+	FFMPEG *f = current;
+	char *r = f ? BuildTags(f) : NULL;
+	LeaveCriticalSection(&demux_lock);
+	return r;
 }
 
 static void WINAPI FF_SetFormat(XMPFORMAT *form)
 {
+	logmsg("cb: SetFormat");
 	FFMPEG *f = current;
 	if (!f) return;
 	form->rate = f->dec->sample_rate;
@@ -1051,8 +1060,10 @@ static void WINAPI FF_GetInfoText(char *format, char *length)
 
 static void WINAPI FF_GetGeneralInfo(char *buf)
 {
+	logmsg("cb: GetGeneralInfo");
+	EnterCriticalSection(&demux_lock);
 	FFMPEG *f = current;
-	if (!f) return;
+	if (!f) { LeaveCriticalSection(&demux_lock); return; }
 	const AVInputFormat *iformat = f->fmt->iformat;
 	buf += sprintf(buf, "Format\t%s\r", iformat && iformat->long_name ? iformat->long_name : "?");
 	buf += sprintf(buf, "Audio codec\t%s\r", f->codec ? f->codec : "?");
@@ -1061,18 +1072,22 @@ static void WINAPI FF_GetGeneralInfo(char *buf)
 	if (f->bitrate) buf += sprintf(buf, "Bit rate\t%u kbps\r", (unsigned)f->bitrate);
 	buf += sprintf(buf, "Sample rate\t%d hz\rChannels\t%d\r",
 		f->dec->sample_rate, f->dec->ch_layout.nb_channels);
+	LeaveCriticalSection(&demux_lock);
 }
 
 static void WINAPI FF_GetMessage(char *buf)
 {
+	logmsg("cb: GetMessage");
+	EnterCriticalSection(&demux_lock);
 	FFMPEG *f = current;
-	if (!f) return;
+	if (!f) { LeaveCriticalSection(&demux_lock); return; }
 	AVDictionary *md[2] = { f->fmt->streams[f->stream]->metadata, f->fmt->metadata };
 	for (int i = 0; i < 2; i++) {
 		AVDictionaryEntry *e = NULL;
 		while ((e = av_dict_get(md[i], "", e, AV_DICT_IGNORE_SUFFIX)))
 			buf = xmpfmisc->FormatInfoText(buf, e->key, e->value);
 	}
+	LeaveCriticalSection(&demux_lock);
 }
 
 // HLS/TS streams can expose their video track LATE (variants load over time).
@@ -1114,6 +1129,11 @@ static DWORD WINAPI FF_Process(float *buffer, DWORD count)
 	if (!f) return 0;
 	video_late_scan(f);
 	if (video.active) video_clock_capture(xmpfstatus->GetTime());
+	{ // liveness heartbeat, 1/sec
+		static DWORD lastbeat;
+		DWORD now = GetTickCount();
+		if (now - lastbeat > 1000) { lastbeat = now; logmsg("cb: Process (alive)"); }
+	}
 	EnterCriticalSection(&demux_lock);
 	DWORD done = 0;
 	int ch = f->dec->ch_layout.nb_channels;
