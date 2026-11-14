@@ -428,11 +428,8 @@ static char *BuildTags(FFMPEG *f)
 		while (len + n + 1 > cap) { cap *= 2; buf = (char*)xmpfmisc->ReAlloc(buf, cap); if (!buf) return 0; } \
 		memcpy(buf + len, s, n); len += n; } while (0)
 
-	{ // filetype first
-		const AVInputFormat *iformat = f->fmt->iformat;
-		TAGAPPEND("filetype");
-		TAGAPPEND(iformat && iformat->long_name ? iformat->long_name : "FFmpeg");
-	}
+	// "filetype" intentionally NOT set (Ian: it renders misleading like "raw"/
+	// "Ogg" - XMPlay's extension-based name is better)
 	for (int i = 0; i < (int)(sizeof(tag_keys) / sizeof(tag_keys[0])); i++) {
 		AVDictionaryEntry *e = av_dict_get(f->fmt->streams[f->stream]->metadata, tag_keys[i], NULL, 0);
 		if (!e) e = av_dict_get(f->fmt->metadata, tag_keys[i], NULL, 0);
@@ -1009,10 +1006,15 @@ static DWORD WINAPI FF_Open(const char *filename, XMPFILE file)
 		video.title[sizeof(video.title) - 1] = 0;
 	}
 	video_attach(current); // shows the window iff this file has video
-	// NOTE: returning 2 (own file routines, per Ian's suggestion) made XMPlay
-	// crash instantly on seek-bar clicks for internet streams - before ever
-	// calling SetPosition. Reverted to 1 (stable); the case is back with Ian.
-	return 1;
+	// 2 = own file routines (Ian-confirmed: enables real seek positions for
+	// internet streams). EXCEPTION: HLS - current XMPlay crashes on HLS seek
+	// when Open returns 2 (un4seen bug, reproduced by Ian, fix coming). When
+	// the XMPlay fix ships, this can become unconditional.
+	if (current->fmt && current->fmt->iformat && !strcmp(current->fmt->iformat->name, "hls")) {
+		logmsg("open: HLS - returning 1 (XMPlay HLS seek bug workaround)");
+		return 1;
+	}
+	return (current->direct_net || !file) ? 2 : 1;
 }
 
 static void WINAPI FF_Close()
@@ -1253,7 +1255,7 @@ static double WINAPI FF_SetPosition(DWORD pos)
 extern "C" __declspec(dllexport) XMPIN *WINAPI XMPIN_GetInterface(DWORD face, InterfaceProc faceproc)
 {
 	static XMPIN xmpin = {
-		XMPIN_FLAG_CANSTREAM | XMPIN_FLAG_MULTIEXT | XMPIN_FLAG_NETSEEK,
+		XMPIN_FLAG_CANSTREAM | XMPIN_FLAG_MULTIEXT | XMPIN_FLAG_NETSEEK | XMPIN_FLAG_OWNFILE,
 		"FFmpeg (audio+video)",
 		"FFmpeg audio\0"
 			"mp3/mp2/mp1/mpa/m4a/m4b/m4r/aac/ac3/eac3/dts/dtshd/hra/mlp/truehd/thd/"
@@ -1320,7 +1322,7 @@ extern "C" __declspec(dllexport) XMPIN *WINAPI XMPIN_GetInterface(DWORD face, In
 			}
 		}
 		logmsg("=== plugin loaded: %s %s | flags=0x%lx | FFmpeg %s | protocols: %s",
-			PLUGIN_NAME, PLUGIN_VER, (unsigned long)(XMPIN_FLAG_CANSTREAM | XMPIN_FLAG_MULTIEXT | XMPIN_FLAG_NETSEEK),
+			PLUGIN_NAME, PLUGIN_VER, (unsigned long)(XMPIN_FLAG_CANSTREAM | XMPIN_FLAG_MULTIEXT | XMPIN_FLAG_NETSEEK | XMPIN_FLAG_OWNFILE),
 			av_version_info(), plist);
 	}
 	return &xmpin;
