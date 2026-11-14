@@ -568,6 +568,15 @@ static BOOL video_make_dib(int w, int h)
 	return video.dib != 0;
 }
 
+// clear the picture to black (frozen frames must not survive stop/switch)
+static void video_blank()
+{
+	if (!video.dib || !video.hwnd) return;
+	memset(video.dib, 0, (size_t)video.dibw * video.dibh * 4);
+	HDC dc = GetDC(video.hwnd);
+	if (dc) { video_paint(dc); ReleaseDC(video.hwnd, dc); }
+}
+
 // present the decoded frame in vframe
 static void video_render_frame()
 {
@@ -597,6 +606,21 @@ static void video_render_frame()
 static void video_tick()
 {
 	if (!video.active || video.hidden || !video.vdec) return;
+
+	// stop = blank the picture (pause keeps the frozen frame). XMPlay answers
+	// the Winamp-compatible IPC_ISPLAYING: 0=stopped, 1=playing, 3=paused.
+	if (xmpwin && IsWindow(xmpwin)) {
+		DWORD_PTR state = 0;
+		if (SendMessageTimeout(xmpwin, 0x0400 /* WM_WA_IPC */, 0, 104 /* IPC_ISPLAYING */,
+				SMTO_ABORTIFHUNG, 100, &state)) {
+			static int stop_grace;
+			if (state == 0) {
+				if (++stop_grace > 10) video_blank(); // ~150ms of "stopped"
+			} else {
+				stop_grace = 0;
+			}
+		}
+	}
 
 	// companion behavior: when XMPlay's window becomes the foreground window
 	// (clicked, restored from the taskbar, alt-tabbed to...), the video window
@@ -929,6 +953,7 @@ static void video_detach()
 	video.have_frame = FALSE;
 	video.vdec = 0; video.fmt = 0;
 	LeaveCriticalSection(&video.lock);
+	video_blank(); // never leave a frozen frame behind
 	if (video.hwnd) PostMessage(video.hwnd, WM_APP_HIDE, 0, 0);
 }
 
