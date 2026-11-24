@@ -40,8 +40,9 @@ extern "C" {
 #endif
 #define PLUGIN_VER  XMP_FFMPEG_VERSION
 
-#define WM_APP_SHOW (WM_APP + 1) // posted window ops run on the window thread
-#define WM_APP_HIDE (WM_APP + 2)
+#define WM_APP_SHOW  (WM_APP + 1) // posted window ops run on the window thread
+#define WM_APP_HIDE  (WM_APP + 2)
+#define WM_APP_BLANK (WM_APP + 3) // clear the picture to black (window thread)
 
 static XMPFUNC_IN     *xmpfin;
 static XMPFUNC_MISC   *xmpfmisc;
@@ -564,6 +565,7 @@ static BOOL video_make_dib(int w, int h)
 	video.bmi.bmiHeader.biBitCount = 32;
 	video.bmi.bmiHeader.biCompression = BI_RGB;
 	video.dib = (BYTE*)malloc((size_t)w * h * 4);
+	if (video.dib) memset(video.dib, 0, (size_t)w * h * 4); // black, not garbage
 	video.dibw = w; video.dibh = h;
 	return video.dib != 0;
 }
@@ -607,20 +609,9 @@ static void video_tick()
 {
 	if (!video.active || video.hidden || !video.vdec) return;
 
-	// stop = blank the picture (pause keeps the frozen frame). XMPlay answers
-	// the Winamp-compatible IPC_ISPLAYING: 0=stopped, 1=playing, 3=paused.
-	if (xmpwin && IsWindow(xmpwin)) {
-		DWORD_PTR state = 0;
-		if (SendMessageTimeout(xmpwin, 0x0400 /* WM_WA_IPC */, 0, 104 /* IPC_ISPLAYING */,
-				SMTO_ABORTIFHUNG, 100, &state)) {
-			static int stop_grace;
-			if (state == 0) {
-				if (++stop_grace > 10) video_blank(); // ~150ms of "stopped"
-			} else {
-				stop_grace = 0;
-			}
-		}
-	}
+	// Blanking on stop/switch is done in video_detach (posted WM_APP_BLANK).
+	// It must NOT be driven from here with a cross-thread SendMessage to XMPlay:
+	// poked every tick it stalled the render loop and made the picture flicker.
 
 	// companion behavior: when XMPlay's window becomes the foreground window
 	// (clicked, restored from the taskbar, alt-tabbed to...), the video window
@@ -830,6 +821,7 @@ static LRESULT CALLBACK video_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 		return 1;
 	case WM_APP_SHOW: {
 		if (xmpwin) SetWindowLong(video.hwnd, GWL_HWNDPARENT, (LONG)xmpwin);
+		video.hidden = FALSE; // a stale HIDE from the previous track may be queued ahead of us
 		// size: default ONCE at the first show, never afterwards - the user's
 		// window size (and fullscreen) is not to be touched during playback
 		if (!video.size_set) {
@@ -850,6 +842,9 @@ static LRESULT CALLBACK video_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 	case WM_APP_HIDE:
 		video.hidden = TRUE;
 		ShowWindow(video.hwnd, SW_HIDE);
+		return 0;
+	case WM_APP_BLANK:
+		video_blank(); // clear the DIB + repaint, always on this window's own thread
 		return 0;
 	case WM_TIMER:
 		video_tick();
@@ -953,8 +948,10 @@ static void video_detach()
 	video.have_frame = FALSE;
 	video.vdec = 0; video.fmt = 0;
 	LeaveCriticalSection(&video.lock);
-	video_blank(); // never leave a frozen frame behind
-	if (video.hwnd) PostMessage(video.hwnd, WM_APP_HIDE, 0, 0);
+	if (video.hwnd) {
+		PostMessage(video.hwnd, WM_APP_BLANK, 0, 0); // clear the frozen frame (window thread)
+		PostMessage(video.hwnd, WM_APP_HIDE, 0, 0);  // then hide it
+	}
 }
 
 // ============================================================= XMPIN methods
@@ -1031,14 +1028,11 @@ static DWORD WINAPI FF_Open(const char *filename, XMPFILE file)
 		video.title[sizeof(video.title) - 1] = 0;
 	}
 	video_attach(current); // shows the window iff this file has video
-	// 2 = own file routines (Ian-confirmed: enables real seek positions for
-	// internet streams). EXCEPTION: HLS - current XMPlay crashes on HLS seek
-	// when Open returns 2 (un4seen bug, reproduced by Ian, fix coming). When
-	// the XMPlay fix ships, this can become unconditional.
-	if (current->fmt && current->fmt->iformat && !strcmp(current->fmt->iformat->name, "hls")) {
-		logmsg("open: HLS - returning 1 (XMPlay HLS seek bug workaround)");
-		return 1;
-	}
+	// 2 = success and XMPlay may close its file: we did the I/O ourselves
+	// (direct networking / no XMPFILE). This makes XMPlay forward real seek
+	// positions for internet streams (Ian @ un4seen). The earlier HLS-only
+	// 'return 1' workaround is gone - XMPlay now releases its HLS state when
+	// Open returns 2 (un4seen forum #21049).
 	return (current->direct_net || !file) ? 2 : 1;
 }
 
