@@ -130,6 +130,7 @@ struct VIDEO {
 	AVRational sar;               // non-square pixel ratio (display aspect)
 	AVRational frame_sar;         // per-frame override when present
 	DWORD last_present;           // GetTickCount of the last frame presented (0 = none yet)
+	BOOL have_new;                // a decoded frame is waiting for FF_VisRenderDC
 };
 static VIDEO video;
 
@@ -580,7 +581,9 @@ static void video_blank()
 	if (dc) { video_paint(dc); ReleaseDC(video.hwnd, dc); }
 }
 
-// present the decoded frame in vframe
+// Scale the decoded frame in vframe into the shared DIB (video.dib). Caller
+// holds video.lock. No GDI here - FF_VisRenderDC later blits this buffer into
+// XMPlay's own visualisation area.
 static void video_render_frame()
 {
 	AVFrame *fr = video.vframe;
@@ -597,43 +600,18 @@ static void video_render_frame()
 	uint8_t *dst[4] = { video.dib, 0, 0, 0 };
 	int ls[4] = { fr->width * 4, 0, 0, 0 };
 	sws_scale(video.sws, fr->data, fr->linesize, 0, fr->height, dst, ls);
-	HDC dc = GetDC(video.hwnd);
-	if (dc) { video_paint(dc); ReleaseDC(video.hwnd, dc); }
-	video.last_present = GetTickCount(); // a frame is now on screen
+	video.have_new = TRUE; // a fresh frame is waiting for FF_VisRenderDC
 }
 
-// -- sync tick: decode/present frames due at the playback position.
-// BOUNDED work per call: without a budget, a broken timestamp stream (all
-// frames "late") makes this loop decode forever while the audio thread keeps
-// feeding packets - 100% CPU spin, starved audio, eventual crash.
-
+// decode the frame(s) due at the playback position into video.dib.
+// BOUNDED work per call: without a budget, a broken-timestamp stream (all
+// frames "late") makes this loop decode forever - 100% CPU spin, starved audio.
 static void video_tick()
 {
-	if (!video.active || video.hidden || !video.vdec) return;
-
-	// Stop/EOS detection without a cross-thread XMPlay query: XMPlay keeps the
-	// input open after you press Stop (FF_Close only fires later / on the next
-	// stop), so detach-blank alone needs "two stops". If no frame has been shown
-	// for a while the track has halted -> close the window ourselves.
-	// (Blanking on switch still happens in video_detach via posted WM_APP_BLANK.)
-	if (video.last_present && GetTickCount() - video.last_present > 400) {
-		video.hidden = TRUE;
-		ShowWindow(video.hwnd, SW_HIDE);
-		return;
-	}
-
-	// companion behavior: when XMPlay's window becomes the foreground window
-	// (clicked, restored from the taskbar, alt-tabbed to...), the video window
-	// rides along and shows itself on top - the pair behaves as one app.
-	if (xmpwin && GetForegroundWindow() == xmpwin)
-		SetWindowPos(video.hwnd, HWND_TOP, 0, 0, 0, 0,
-			SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-
-	double t = video_clock_now(); // interpolated playback clock
-	BOOL do_render = FALSE;
-
+	if (!video.active || !video.vdec) return;
+	double t = video_clock_now();
 	EnterCriticalSection(&video.lock);
-	if (!video.active) { LeaveCriticalSection(&video.lock); return; }
+	if (!video.active || !video.vdec) { LeaveCriticalSection(&video.lock); return; }
 	int budget = 8; // max decode/feed iterations this tick
 	while (budget-- > 0) {
 		if (!video.have_frame) {
@@ -680,19 +658,15 @@ static void video_tick()
 		}
 		// have a decoded frame: show it when due, drop when far too late
 		if (video.frame_pts > t + 0.06) break;   // in the future - wait
-		if (video.frame_pts < t - 0.30 && budget > 2) { // behind - drop, but
-			video.have_frame = FALSE;            // never burn the whole budget
+		if (video.frame_pts < t - 0.30 && budget > 2) { // behind - drop
+			video.have_frame = FALSE;
 			continue;
 		}
-		do_render = TRUE;
+		video_render_frame(); // scale into video.dib (under lock); sets have_new
 		video.have_frame = FALSE;
 		break; // one present per tick is enough
 	}
 	LeaveCriticalSection(&video.lock);
-
-	// heavy work (scale + blit) happens OUTSIDE the lock so the audio thread
-	// never waits behind GDI
-	if (do_render) video_render_frame();
 }
 
 // -- window
@@ -868,27 +842,11 @@ static LRESULT CALLBACK video_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
 static DWORD WINAPI video_thread(LPVOID)
 {
-	WNDCLASSEX wc;
-	memset(&wc, 0, sizeof(wc));
-	wc.cbSize = sizeof(wc);
-	wc.lpfnWndProc = video_wndproc;
-	wc.hInstance = GetModuleHandle(0);
-	wc.hCursor = LoadCursor(0, IDC_ARROW);
-	wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
-	wc.lpszClassName = "xmp-ffmpeg-video";
-	RegisterClassEx(&wc);
-
-	video.hwnd = CreateWindowEx(WS_EX_TOOLWINDOW, "xmp-ffmpeg-video", "xmp-ffmpeg",
-		WS_POPUP | WS_THICKFRAME, CW_USEDEFAULT, CW_USEDEFAULT, 640, 480,
-		xmpwin, 0, wc.hInstance, 0); // owner = XMPlay main window
-	SetTimer(video.hwnd, 1, 15, 0);
-	video_round_corners(video.hwnd);
-	SetEvent(video.ready);
-
-	MSG msg;
-	while (GetMessage(&msg, 0, 0, 0) > 0) {
-		TranslateMessage(&msg);
-		DispatchMessage(&msg);
+	// B2: no window of our own - just keep the latest frame decoded into
+	// video.dib; XMPlay's vis area shows it via FF_VisRenderDC.
+	while (1) {
+		video_tick();
+		Sleep(15); // ~66fps cadence, plenty for SD content
 	}
 	return 0;
 }
@@ -898,9 +856,7 @@ static void video_window_init()
 	if (video.running) return;
 	video.clock_base = 0;
 	video.clock_tick = GetTickCount();
-	video.ready = CreateEvent(0, TRUE, FALSE, 0);
 	video.thread = CreateThread(0, 0, video_thread, 0, 0, &video.threadid);
-	if (video.ready) WaitForSingleObject(video.ready, 3000);
 	video.running = TRUE;
 }
 
@@ -942,9 +898,10 @@ static void video_attach(FFMPEG *f)
 		if (fr.num > 0 && fr.den > 0) video.frame_dur = (double)fr.den / fr.num;
 	}
 	video.sar = av_guess_sample_aspect_ratio(f->fmt, f->fmt->streams[f->vstream], NULL);
+	video.have_new = FALSE;
 	video.active = TRUE;
 	LeaveCriticalSection(&video.lock);
-	video_show(f);
+	video_window_init(); // make sure the decoder thread is alive
 }
 
 // hide + disengage (Close / audio-only / teardown)
@@ -957,11 +914,62 @@ static void video_detach()
 	video.qhead = video.qtail = 0; video.qcount = 0;
 	video.have_frame = FALSE;
 	video.vdec = 0; video.fmt = 0;
+	video.have_new = FALSE;
 	LeaveCriticalSection(&video.lock);
-	if (video.hwnd) {
-		PostMessage(video.hwnd, WM_APP_BLANK, 0, 0); // clear the frozen frame (window thread)
-		PostMessage(video.hwnd, WM_APP_HIDE, 0, 0);  // then hide it
+}
+
+// ------------------------------------------------------- XMPlay vis callbacks
+// B2: the video shows in XMPlay's OWN visualisation area. XMPlay opens/closes/
+// fullscreen-s it (VisOpen/VisClose + the area's own double-click); we just
+// hand it the latest decoded frame via FF_VisRenderDC. No window of our own.
+
+static BOOL WINAPI FF_VisOpen(DWORD colors[3])
+{
+	logmsg("vis: open");
+	video_window_init(); // ensure the decoder thread is alive
+	return TRUE;
+}
+
+static void WINAPI FF_VisClose()
+{
+	logmsg("vis: close");
+}
+
+static void WINAPI FF_VisSize(HDC dc, SIZE *size)
+{
+	if (size) { size->cx = video.dibw ? video.dibw : 640; size->cy = video.dibh ? video.dibh : 480; }
+}
+
+static BOOL WINAPI FF_VisRender(DWORD *buf, SIZE size, DWORD flags)
+{
+	return FALSE; // we render through the DC variant
+}
+
+static BOOL WINAPI FF_VisRenderDC(HDC dc, SIZE size, DWORD flags)
+{
+	if (!video.dib || video.dibw < 1 || !video.vdec) return FALSE;
+	EnterCriticalSection(&video.lock);
+	if (!video.have_new) { LeaveCriticalSection(&video.lock); return FALSE; } // unchanged
+	RECT rc = { 0, 0, size.cx, size.cy };
+	FillRect(dc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
+	if (video.dibw >= 1 && video.dibh >= 1) {
+		double sar = 1.0;
+		AVRational fsar = video.frame_sar;
+		if (fsar.num <= 0 || fsar.den <= 0) fsar = video.sar;
+		if (fsar.num > 0 && fsar.den > 0) sar = (double)fsar.num / fsar.den;
+		double va = (double)video.dibw / video.dibh * sar;
+		double wa = (double)size.cx / (size.cy > 0 ? size.cy : 1);
+		int w, h, x, y;
+		if (wa > va) { h = size.cy; w = (int)(h * va + 0.5); x = (size.cx - w) / 2; y = 0; }
+		else          { w = size.cx; h = (int)(w / va + 0.5); x = 0; y = (size.cy - h) / 2; }
+		if (w < 1) w = 1;
+		if (h < 1) h = 1;
+		StretchDIBits(dc, x, y, w, h, 0, 0, video.dibw, video.dibh,
+			video.dib, &video.bmi, DIB_RGB_COLORS, SRCCOPY);
 	}
+	video.have_new = FALSE;
+	LeaveCriticalSection(&video.lock);
+	return TRUE;
 }
 
 // ============================================================= XMPIN methods
@@ -1317,7 +1325,14 @@ extern "C" __declspec(dllexport) XMPIN *WINAPI XMPIN_GetInterface(DWORD face, In
 		NULL,             // GetSubSongs
 		NULL,
 		NULL,             // GetDownloaded
-		// no built-in visualisation
+		"FFmpeg video",   // visname (B2: video shows in XMPlay's vis area)
+		FF_VisOpen,
+		FF_VisClose,
+		FF_VisSize,
+		FF_VisRender,
+		FF_VisRenderDC,
+		NULL,             // VisButton (fullscreen is the vis area's own double-click)
+		NULL,             // VisConfig ("video mode" toggle - add later)
 	};
 
 	if (face != XMPIN_FACE) {
