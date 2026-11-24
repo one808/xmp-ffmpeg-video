@@ -129,6 +129,7 @@ struct VIDEO {
 	double last_pts, frame_dur;   // pts fallback for streams without stamps
 	AVRational sar;               // non-square pixel ratio (display aspect)
 	AVRational frame_sar;         // per-frame override when present
+	DWORD last_present;           // GetTickCount of the last frame presented (0 = none yet)
 };
 static VIDEO video;
 
@@ -598,6 +599,7 @@ static void video_render_frame()
 	sws_scale(video.sws, fr->data, fr->linesize, 0, fr->height, dst, ls);
 	HDC dc = GetDC(video.hwnd);
 	if (dc) { video_paint(dc); ReleaseDC(video.hwnd, dc); }
+	video.last_present = GetTickCount(); // a frame is now on screen
 }
 
 // -- sync tick: decode/present frames due at the playback position.
@@ -609,9 +611,16 @@ static void video_tick()
 {
 	if (!video.active || video.hidden || !video.vdec) return;
 
-	// Blanking on stop/switch is done in video_detach (posted WM_APP_BLANK).
-	// It must NOT be driven from here with a cross-thread SendMessage to XMPlay:
-	// poked every tick it stalled the render loop and made the picture flicker.
+	// Stop/EOS detection without a cross-thread XMPlay query: XMPlay keeps the
+	// input open after you press Stop (FF_Close only fires later / on the next
+	// stop), so detach-blank alone needs "two stops". If no frame has been shown
+	// for a while the track has halted -> close the window ourselves.
+	// (Blanking on switch still happens in video_detach via posted WM_APP_BLANK.)
+	if (video.last_present && GetTickCount() - video.last_present > 400) {
+		video.hidden = TRUE;
+		ShowWindow(video.hwnd, SW_HIDE);
+		return;
+	}
 
 	// companion behavior: when XMPlay's window becomes the foreground window
 	// (clicked, restored from the taskbar, alt-tabbed to...), the video window
@@ -822,6 +831,7 @@ static LRESULT CALLBACK video_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 	case WM_APP_SHOW: {
 		if (xmpwin) SetWindowLong(video.hwnd, GWL_HWNDPARENT, (LONG)xmpwin);
 		video.hidden = FALSE; // a stale HIDE from the previous track may be queued ahead of us
+		video.last_present = 0; // a freshly-shown track hasn't shown a frame yet
 		// size: default ONCE at the first show, never afterwards - the user's
 		// window size (and fullscreen) is not to be touched during playback
 		if (!video.size_set) {
