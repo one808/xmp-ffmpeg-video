@@ -947,10 +947,25 @@ static BOOL WINAPI FF_VisRender(DWORD *buf, SIZE size, DWORD flags)
 
 static BOOL WINAPI FF_VisRenderDC(HDC dc, SIZE size, DWORD flags)
 {
-	if (!video.dib || video.dibw < 1 || !video.vdec) return FALSE;
+	RECT rc = { 0, 0, size.cx, size.cy };
+
+	// main-program-driven blank: when XMPlay has stopped/paused, its status face
+	// says "not playing" -> show black so the last frame doesn't linger in the
+	// vis area. (XMPlay itself only clears the vis AREA / main-window clock on
+	// a full close - that part is not something the plugin controls.)
+	if (xmpfstatus && !xmpfstatus->IsPlaying()) {
+		FillRect(dc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
+		return TRUE;
+	}
+
+	// no video stream on this track (audio-only) -> keep it blank
+	if (!video.dib || video.dibw < 1 || !video.vdec) {
+		FillRect(dc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
+		return TRUE;
+	}
+
 	EnterCriticalSection(&video.lock);
 	if (!video.have_new) { LeaveCriticalSection(&video.lock); return FALSE; } // unchanged
-	RECT rc = { 0, 0, size.cx, size.cy };
 	FillRect(dc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
 	if (video.dibw >= 1 && video.dibh >= 1) {
 		double sar = 1.0;
@@ -964,8 +979,12 @@ static BOOL WINAPI FF_VisRenderDC(HDC dc, SIZE size, DWORD flags)
 		else          { w = size.cx; h = (int)(w / va + 0.5); x = 0; y = (size.cy - h) / 2; }
 		if (w < 1) w = 1;
 		if (h < 1) h = 1;
+		// smooth (filtered) scaling - the default GDI stretch jaggies badly,
+		// especially when shrinking the video into a small vis area
+		int oldmode = SetStretchBltMode(dc, HALFTONE);
 		StretchDIBits(dc, x, y, w, h, 0, 0, video.dibw, video.dibh,
 			video.dib, &video.bmi, DIB_RGB_COLORS, SRCCOPY);
+		SetStretchBltMode(dc, oldmode);
 	}
 	video.have_new = FALSE;
 	LeaveCriticalSection(&video.lock);
