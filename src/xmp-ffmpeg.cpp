@@ -40,17 +40,12 @@ extern "C" {
 #endif
 #define PLUGIN_VER  XMP_FFMPEG_VERSION
 
-#define WM_APP_SHOW  (WM_APP + 1) // posted window ops run on the window thread
-#define WM_APP_HIDE  (WM_APP + 2)
-#define WM_APP_BLANK (WM_APP + 3) // clear the picture to black (window thread)
-
 static XMPFUNC_IN     *xmpfin;
 static XMPFUNC_MISC   *xmpfmisc;
 static XMPFUNC_FILE   *xmpffile;
 static XMPFUNC_TEXT   *xmpftext;
 static XMPFUNC_STATUS *xmpfstatus;
 static DWORD xmpver;
-static HWND xmpwin; // XMPlay's main window - owner of the video window
 
 struct FFMPEG {
 	XMPFILE file;
@@ -91,7 +86,7 @@ static CRITICAL_SECTION demux_lock; // guards av_read_frame/av_seek_frame/send
 // video queue buffering: FF_Process tops the queue up to this depth so the
 // decode thread never starves (the audio-demand feed alone delivers video
 // packets ~just-in-time; see the post-seek judder, v1.2.43 logs)
-#define VQ_TARGET 40
+#define VQ_TARGET 60
 #define VQ_LOOKAHEAD_MAX 64
 
 // --------------------------------------------------------------- video state
@@ -102,9 +97,8 @@ struct VIDEO {
 	CRITICAL_SECTION lock;
 	volatile BOOL active;      // a video stream is attached
 	volatile BOOL running;     // render thread alive
-	HWND hwnd;                 // window (owned by the render thread)
 	DWORD threadid;
-	HANDLE thread, ready;      // ready event: window created
+	HANDLE thread;
 	// demuxer/decoder refs (freed by the audio side, used under lock)
 	AVFormatContext *fmt;
 	AVCodecContext *vdec;
@@ -117,36 +111,21 @@ struct VIDEO {
 	// rendering
 	SwsContext *sws;
 	int sws_w, sws_h, sws_fmt;
-	// persistent double buffer (render thread only), rebuilt on size change
-	HDC memdc;
-	HBITMAP membmp;
-	HGDIOBJ memold;
-	int memw, memh;
 	AVFrame *vframe;
 	BOOL have_frame;           // decoded frame in vframe, waiting for its time
 	double frame_pts;
 	BYTE *dib;                 // BGRA DIBits
 	BITMAPINFO bmi;
 	int dibw, dibh;
-	BOOL fullscreen;
-	WINDOWPLACEMENT saved;     // windowed placement before fullscreen
-	BOOL saved_valid;
-	BOOL hidden;
-	char title[512];
 	// playback clock: captured on XMPlay's thread, interpolated here. The
 	// render thread must NEVER call XMPlay functions (deadlock risk).
 	double clock_base;
 	DWORD clock_tick;
-	int show_w, show_h;
-	BOOL size_set;           // default size applied once - NEVER resize the
-	                         // user's window afterwards
 	double last_pts, frame_dur;   // pts fallback for streams without stamps
 	AVRational sar;               // non-square pixel ratio (display aspect)
 	AVRational frame_sar;         // per-frame override when present
-	DWORD last_present;           // GetTickCount of the last frame presented (0 = none yet)
 	BOOL have_new;                // a decoded frame is waiting for FF_VisRenderDC
 	BOOL vis_blank;               // vis area currently black (cleared on stop)
-	volatile DWORD last_feed_tick; // last FF_Process call (audio liveness gate)
 	volatile BOOL seeking;         // seek catch-up in progress (show black meanwhile)
 };
 static VIDEO video;
@@ -523,56 +502,6 @@ static double video_clock_now()
 
 // -- rendering
 
-static void video_paint(HDC dc)
-{
-	RECT rc;
-	GetClientRect(video.hwnd, &rc);
-	int cw = rc.right, ch = rc.bottom;
-	if (cw < 1 || ch < 1) return;
-
-	// double buffering: compose into an offscreen bitmap, blit once. Painting
-	// black-then-frame straight to the window flickers visibly.
-	if (!video.memdc || video.memw != cw || video.memh != ch) {
-		if (video.memdc) {
-			SelectObject(video.memdc, video.memold);
-			DeleteObject(video.membmp);
-			DeleteDC(video.memdc);
-		}
-		video.memdc = CreateCompatibleDC(dc);
-		video.membmp = CreateCompatibleBitmap(dc, cw, ch);
-		video.memold = SelectObject(video.memdc, video.membmp);
-		video.memw = cw;
-		video.memh = ch;
-	}
-	HDC mem = video.memdc;
-
-	// clear the whole client: no stale pixels around the letterbox
-	FillRect(mem, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
-
-	if (video.dib && video.dibw >= 1) {
-		// display aspect honors non-square pixels (DVD/TS/MKV anamorphic sources)
-		double sar = 1.0;
-		AVRational fsar = video.frame_sar;
-		if (fsar.num <= 0 || fsar.den <= 0) fsar = video.sar;
-		if (fsar.num > 0 && fsar.den > 0) sar = (double)fsar.num / fsar.den;
-
-		int w, h, x, y;
-		double va = (double)video.dibw / video.dibh * sar, wa = (double)cw / ch;
-		if (wa > va) { h = ch; w = (int)(h * va + 0.5); x = (cw - w) / 2; y = 0; }
-		else { w = cw; h = (int)(w / va + 0.5); x = 0; y = (ch - h) / 2; }
-		if (w < 1) w = 1;
-		if (h < 1) h = 1;
-
-		// smooth (filtered) scaling
-		int oldmode = SetStretchBltMode(mem, HALFTONE);
-		StretchDIBits(mem, x, y, w, h, 0, 0, video.dibw, video.dibh,
-			video.dib, &video.bmi, DIB_RGB_COLORS, SRCCOPY);
-		SetStretchBltMode(mem, oldmode);
-	}
-
-	BitBlt(dc, 0, 0, cw, ch, mem, 0, 0, SRCCOPY);
-}
-
 static BOOL video_make_dib(int w, int h)
 {
 	if (video.dib && video.dibw == w && video.dibh == h) return TRUE;
@@ -588,15 +517,6 @@ static BOOL video_make_dib(int w, int h)
 	if (video.dib) memset(video.dib, 0, (size_t)w * h * 4); // black, not garbage
 	video.dibw = w; video.dibh = h;
 	return video.dib != 0;
-}
-
-// clear the picture to black (frozen frames must not survive stop/switch)
-static void video_blank()
-{
-	if (!video.dib || !video.hwnd) return;
-	memset(video.dib, 0, (size_t)video.dibw * video.dibh * 4);
-	HDC dc = GetDC(video.hwnd);
-	if (dc) { video_paint(dc); ReleaseDC(video.hwnd, dc); }
 }
 
 // Scale the decoded frame in vframe into the shared DIB (video.dib). Caller
@@ -717,176 +637,9 @@ static void video_tick()
 	}
 }
 
-// -- window
-
-// Find XMPlay's main window. MUST be a window of our own process: the owner
-// captured at plugin-load time can be ANY foreground window (e.g. Explorer),
-// which makes the video window follow the wrong "parent" in z-order.
-static BOOL CALLBACK enum_proc(HWND hwnd, LPARAM lp)
-{
-	DWORD pid = 0;
-	GetWindowThreadProcessId(hwnd, &pid);
-	if (pid == GetCurrentProcessId() && IsWindowVisible(hwnd) && !GetWindow(hwnd, 4 /* GW_OWNER */)
-		&& hwnd != video.hwnd) {
-		*(HWND*)lp = hwnd;
-		return FALSE;
-	}
-	return TRUE;
-}
-
-static HWND find_xmpwin()
-{
-	HWND fg = GetForegroundWindow();
-	DWORD pid = 0;
-	if (fg) GetWindowThreadProcessId(fg, &pid);
-	if (fg && pid == GetCurrentProcessId() && fg != video.hwnd) return fg;
-	HWND found = 0;
-	EnumWindows(enum_proc, (LPARAM)&found);
-	return found;
-}
-
-// Win11 rounds the corners of normal windows; our borderless style
-// (WM_NCCALCSIZE=0) loses that. Ask DWM for rounded corners via the API,
-// LOADED DYNAMICALLY - dwmapi.dll does not exist on XP and a dynamic load
-// never shows up in the import table, so the XP audit stays clean.
-static void video_round_corners(HWND hwnd)
-{
-	typedef long (WINAPI *DwmSetWindowAttribute_t)(HWND, DWORD, const void *, DWORD);
-	HMODULE dwm = LoadLibraryA("dwmapi.dll");
-	if (!dwm) return;
-	DwmSetWindowAttribute_t pfn = (DwmSetWindowAttribute_t)GetProcAddress(dwm, "DwmSetWindowAttribute");
-	if (pfn) {
-		DWORD pref = 2; // DWMWCP_ROUND
-		pfn(hwnd, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */, &pref, sizeof(pref));
-	}
-}
-
-static void video_toggle_fullscreen()
-{
-	video.fullscreen = !video.fullscreen;
-	if (video.fullscreen) {
-		video.saved.length = sizeof(video.saved);
-		video.saved_valid = GetWindowPlacement(video.hwnd, &video.saved);
-		HMONITOR mon = MonitorFromWindow(video.hwnd, MONITOR_DEFAULTTONEAREST);
-		MONITORINFO mi; mi.cbSize = sizeof(mi);
-		GetMonitorInfo(mon, &mi);
-		SetWindowLong(video.hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
-		SetWindowPos(video.hwnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
-			mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
-			SWP_FRAMECHANGED | SWP_SHOWWINDOW);
-	} else {
-		SetWindowLong(video.hwnd, GWL_STYLE, WS_POPUP | WS_THICKFRAME | WS_VISIBLE);
-		if (video.saved_valid) SetWindowPlacement(video.hwnd, &video.saved);
-		else SetWindowPos(video.hwnd, 0, 0, 0, 640, 480, SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED);
-		SetWindowPos(video.hwnd, 0, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
-	}
-}
-
-static LRESULT CALLBACK video_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
-{
-	switch (msg) {
-	case WM_NCCALCSIZE: // the ENTIRE window is client area: no painted frame
-		return 0;       // (WS_THICKFRAME stays only so HT* resizing works)
-	case WM_NCPAINT:
-		return 0;       // nothing non-client to paint - no white edge
-	case WM_NCHITTEST: { // borderless: manual resize edges + drag + resize
-		if (video.fullscreen) return HTCLIENT;
-		POINT pt;
-		pt.x = (short)((DWORD)lp & 0xffff);
-		pt.y = (short)(((DWORD)lp >> 16) & 0xffff);
-		RECT wr;
-		GetWindowRect(hwnd, &wr);
-		int b = 8; // resize border width in px
-		BOOL l = pt.x < wr.left + b, r = pt.x >= wr.right - b;
-		BOOL t = pt.y < wr.top + b, bo = pt.y >= wr.bottom - b;
-		if (t && l) return HTTOPLEFT;
-		if (t && r) return HTTOPRIGHT;
-		if (bo && l) return HTBOTTOMLEFT;
-		if (bo && r) return HTBOTTOMRIGHT;
-		if (t) return HTTOP;
-		if (bo) return HTBOTTOM;
-		if (l) return HTLEFT;
-		if (r) return HTRIGHT;
-		return HTCAPTION; // drag anywhere else
-	}
-	case WM_NCLBUTTONDBLCLK: // double-click on the drag area (our client is
-		if (wp == HTCAPTION) { // reported as caption!) = fullscreen toggle
-			video_toggle_fullscreen();
-			return 0;
-		}
-		break;
-	case WM_LBUTTONDBLCLK:
-		video_toggle_fullscreen();
-		return 0;
-	case WM_GETMINMAXINFO: { // keep a sane minimum size
-		MINMAXINFO *mm = (MINMAXINFO*)lp;
-		mm->ptMinTrackSize.x = 160;
-		mm->ptMinTrackSize.y = 120;
-		return 0;
-	}
-	case WM_KEYDOWN:
-		if (wp == 'F') { video_toggle_fullscreen(); return 0; }
-		if (wp == VK_ESCAPE) {
-			if (video.fullscreen) video_toggle_fullscreen();
-			else { video.hidden = TRUE; ShowWindow(hwnd, SW_HIDE); }
-			return 0;
-		}
-		if (wp == VK_RETURN) { video_toggle_fullscreen(); return 0; }
-		break;
-	case WM_PAINT: {
-		PAINTSTRUCT ps;
-		HDC dc = BeginPaint(hwnd, &ps);
-		video_paint(dc); // double buffered: black + frame composed offscreen
-		EndPaint(hwnd, &ps);
-		return 0;
-	}
-	case WM_ACTIVATE:
-		// owned-window z-order only guarantees WE sit above XMPlay - clicking
-		// us would leave XMPlay behind other apps' windows. Keep the owner
-		// visible right below us (without stealing focus).
-		if (LOWORD(wp) != 0 /* WA_INACTIVE */ && xmpwin)
-			SetWindowPos(xmpwin, video.hwnd, 0, 0, 0, 0,
-				SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-		break;
-	case WM_ERASEBKGND:
-		return 1;
-	case WM_APP_SHOW: {
-		if (xmpwin) SetWindowLong(video.hwnd, GWL_HWNDPARENT, (LONG)xmpwin);
-		video.hidden = FALSE; // a stale HIDE from the previous track may be queued ahead of us
-		video.last_present = 0; // a freshly-shown track hasn't shown a frame yet
-		// size: default ONCE at the first show, never afterwards - the user's
-		// window size (and fullscreen) is not to be touched during playback
-		if (!video.size_set) {
-			SetWindowPos(video.hwnd, HWND_TOP, 0, 0, video.show_w, video.show_h,
-				SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED);
-			video.size_set = TRUE;
-		} else {
-			SetWindowPos(video.hwnd, HWND_TOP, 0, 0, 0, 0,
-				SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER);
-		}
-		WCHAR wt[512];
-		MultiByteToWideChar(CP_UTF8, 0, video.title, -1, wt, 512);
-		SetWindowTextW(video.hwnd, wt);
-		ShowWindow(video.hwnd, SW_SHOW);
-		SetForegroundWindow(video.hwnd);
-		return 0;
-	}
-	case WM_APP_HIDE:
-		video.hidden = TRUE;
-		ShowWindow(video.hwnd, SW_HIDE);
-		return 0;
-	case WM_APP_BLANK:
-		video_blank(); // clear the DIB + repaint, always on this window's own thread
-		return 0;
-	case WM_TIMER:
-		video_tick();
-		return 0;
-	case WM_SIZE:
-		InvalidateRect(hwnd, 0, FALSE);
-		return 0;
-	}
-	return DefWindowProc(hwnd, msg, wp, lp);
-}
+// -- window (B1 standalone borderless window: removed. The video now renders
+// into XMPlay's own vis area - see FF_VisRenderDC; the render thread below
+// only decodes into video.dib)
 
 static DWORD WINAPI video_thread(LPVOID)
 {
@@ -912,25 +665,7 @@ static void video_window_init()
 	video.running = TRUE;
 }
 
-static void video_show(FFMPEG *f)
-{
-	video_window_init();
-	if (!video.hwnd) return;
-	// default size = native video size, clamped to the work area
-	int w = f->vw > 0 ? f->vw : 640, h = f->vh > 0 ? f->vh : 480;
-	RECT wa; SystemParametersInfo(SPI_GETWORKAREA, 0, &wa, 0);
-	int maxw = (int)((wa.right - wa.left) * 0.85), maxh = (int)((wa.bottom - wa.top) * 0.85);
-	while (w > maxw || h > maxh) { w = w * 9 / 10; h = h * 9 / 10; }
-	// ALL window operations happen on the window thread (posted, never
-	// cross-thread SendMessage) - see WM_APP_SHOW below.
-	video.show_w = w;
-	video.show_h = h;
-	video.hidden = FALSE;
-	xmpwin = find_xmpwin(); // owner must be XMPlay itself, not whatever had focus at load
-	PostMessage(video.hwnd, WM_APP_SHOW, 0, 0);
-}
-
-// called after a successful Open: attach this file's video to the window
+// called after a successful Open: attach this file's video to the vis area
 static void video_attach(FFMPEG *f)
 {
 	if (!f || f->vstream < 0) {
@@ -1144,14 +879,7 @@ static DWORD WINAPI FF_Open(const char *filename, XMPFILE file)
 	xmpfin->SetLength((float)(current->duration > 0 ? current->duration : -1), current->seekable);
 	if (current->netfile)
 		xmpffile->NetSetRate(file, current->bitrate ? current->bitrate * 125 : 32000);
-	// window title (stored UTF-8)
-	{
-		char t[460];
-		snprintf(t, sizeof(t), "%s - " PLUGIN_NAME, filename ? filename : "");
-		strncpy(video.title, t, sizeof(video.title) - 1);
-		video.title[sizeof(video.title) - 1] = 0;
-	}
-	video_attach(current); // shows the window iff this file has video
+	video_attach(current); // attach the vis video iff this file has a video stream
 	// 2 = success and XMPlay may close its file: we did the I/O ourselves
 	// (direct networking / no XMPFILE). This makes XMPlay forward real seek
 	// positions for internet streams (Ian @ un4seen). The earlier HLS-only
@@ -1594,10 +1322,8 @@ extern "C" __declspec(dllexport) XMPIN *WINAPI XMPIN_GetInterface(DWORD face, In
 	xmpftext  = (XMPFUNC_TEXT*)faceproc(XMPFUNC_TEXT_FACE);
 	xmpfstatus = (XMPFUNC_STATUS*)faceproc(XMPFUNC_STATUS_FACE);
 	xmpver = xmpfmisc->GetVersion();
-	xmpwin = find_xmpwin(); // refreshed again at each show
 	InitializeCriticalSection(&video.lock);
 	InitializeCriticalSection(&demux_lock);
-	video.ready = 0;
 	video.vframe = av_frame_alloc();
 	av_log_set_callback(ff_log_cb);
 	{
