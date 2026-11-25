@@ -677,9 +677,13 @@ static void video_tick()
 			video.have_frame = TRUE;
 			continue;
 		}
-		// have a decoded frame: show it when due, drop when far too late
+		// have a decoded frame: show it when due, drop when far too late.
+		// While a seek catch-up is in progress the drop budget is unlimited:
+		// stale frames must NOT be shown (they'd flash old content and clear
+		// `seeking` early) - keep the area black until a frame in the target
+		// window is shown.
 		if (video.frame_pts > t + 0.06) break;   // in the future - wait
-		if (video.frame_pts < t - 0.30 && budget > 2) { // behind - drop
+		if (video.frame_pts < t - 0.30 && (budget > 2 || video.seeking)) { // behind - drop
 			video.have_frame = FALSE;
 			ndrop++;
 			continue;
