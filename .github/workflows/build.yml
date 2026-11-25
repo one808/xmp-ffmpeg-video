@@ -7,7 +7,7 @@ run-name: "xmp-ffmpeg · ${{ inputs.linkage || 'static' }}"
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches: [main, lrc-lyrics]
 
 permissions:
   contents: write # for the 'latest' release upload
