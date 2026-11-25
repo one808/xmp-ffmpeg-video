@@ -1591,13 +1591,13 @@ static int lyric_render(HDC dc, int W, int H)
 	int cy = H / 2;                      // focal line anchored mid-panel
 
 	double fp = 0;                       // focal position in line-space
+	int cur = -1;                        // current line index (the large one)
 	const char *texts[48];
 	int idxs[48];
 	int n = 0;
 	{
 		EnterCriticalSection(&lyric.lock);
 		if (lyric.state == 2 && lyric.nlines > 0) {
-			int cur = -1;
 			for (int i = 0; i < lyric.nlines; i++)
 				if (t >= lyric.lines[i].t) cur = i;
 			if (cur < 0) cur = 0;
@@ -1629,34 +1629,21 @@ static int lyric_render(HDC dc, int W, int H)
 	int R = (bg >> 16) & 0xff, G = (bg >> 8) & 0xff, B = bg & 0xff;
 	int tr = (txt >> 16) & 0xff, tg = (txt >> 8) & 0xff, tb = txt & 0xff;
 	int dr = R + (tr - R) / 2, dg = G + (tg - G) / 2, db = B + (tb - B) / 2; // dim base
-	int ar = (int)((lrc_cfg.cur_color >> 16) & 0xff);
-	int ag = (int)((lrc_cfg.cur_color >> 8) & 0xff);
-	int ab = (int)(lrc_cfg.cur_color & 0xff);
+	int bigpt = (int)(lrc_cfg.font_size * 1.5 + 0.5); // the current line, larger
 
 	HFONT oldf = (HFONT)SelectObject(dc, lrc_font_pt(lrc_cfg.font_size));
 	HPEN oldpen = (HPEN)SelectObject(dc, GetStockObject(NULL_PEN));
 	HGDIOBJ oldbr = SelectObject(dc, GetStockObject(NULL_BRUSH));
 	SetBkMode(dc, TRANSPARENT);
 	for (int k = 0; k < n; k++) {
-		double dist = (double)idxs[k] - fp;         // 0 at focal, + below, - above
-		double ad = (dist < 0) ? -dist : dist;
-		double scale = 1.0 - 0.20 * ad;             // focal biggest, shrinking away
-		if (scale < 0.55) scale = 0.55;
-		if (scale > 1.0) scale = 1.0;
-		int pt = (int)(lrc_cfg.font_size * scale + 0.5);
-		double emph = 1.0 - ad / 3.0;               // accent fades with distance
-		if (emph < 0) emph = 0;
-		if (emph > 1) emph = 1;
-		int m = (int)(emph * 100 + 0.5);
-		int cr = dr + (ar - dr) * m / 100;
-		int cg = dg + (ag - dg) * m / 100;
-		int cb = db + (ab - db) * m / 100;
+		int iscur = (idxs[k] == cur);
+		double dist = (double)idxs[k] - fp;
 		int y = cy + (int)(dist * lh + 0.5);         // smooth sub-line scroll
 		wchar_t wtext[512];
 		MultiByteToWideChar(CP_UTF8, 0, texts[k], -1, wtext, 512);
 		RECT rc = { 0, y - lh / 2, W, y + lh / 2 };
-		SelectObject(dc, lrc_font_pt(pt));
-		SetTextColor(dc, RGB(cr, cg, cb));
+		SelectObject(dc, lrc_font_pt(iscur ? bigpt : lrc_cfg.font_size));
+		SetTextColor(dc, iscur ? (COLORREF)lrc_cfg.cur_color : RGB(dr, dg, db));
 		DrawTextW(dc, wtext, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 	}
 	SelectObject(dc, oldf);
