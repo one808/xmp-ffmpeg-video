@@ -1917,10 +1917,11 @@ static DWORD WINAPI FF_Open(const char *filename, XMPFILE file)
 			} else {
 				bcpy(t2, sizeof t2, stem);        // no separator: whole stem
 			}
-			while (*a == ' ' || *a == '\t') a++;
-			while (*t2 == ' ' || *t2 == '\t') t2++;
-			if (!artist[0] && a[0]) bcpy(artist, sizeof artist, a);
-			if (!title[0]) bcpy(title, sizeof title, t2[0] ? t2 : stem);
+			char *pa = a, *pt = t2;   // trim via pointers (arrays can't ++ )
+			while (*pa == ' ' || *pa == '\t') pa++;
+			while (*pt == ' ' || *pt == '\t') pt++;
+			if (!artist[0] && pa[0]) bcpy(artist, sizeof artist, pa);
+			if (!title[0]) bcpy(title, sizeof title, pt[0] ? pt : stem);
 		}
 		lyric_start(current, filename, artist, title, is_local);
 	}
