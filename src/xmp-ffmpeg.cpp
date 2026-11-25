@@ -80,6 +80,10 @@ struct FFMPEG {
 	// input full). The audio thread drains these before its own reads.
 	AVPacket *pend_a[8];
 	int pend_n;
+	// seek fast-forward pending: FF_SetPosition sets it to the target; the
+	// audio thread runs the read-and-skip on its next FF_Process call (never
+	// the UI thread - a network download must not freeze XMPlay)
+	double ff_target;
 };
 static FFMPEG *current;
 static CRITICAL_SECTION demux_lock; // guards av_read_frame/av_seek_frame/send
@@ -142,6 +146,8 @@ struct VIDEO {
 	DWORD last_present;           // GetTickCount of the last frame presented (0 = none yet)
 	BOOL have_new;                // a decoded frame is waiting for FF_VisRenderDC
 	BOOL vis_blank;               // vis area currently black (cleared on stop)
+	volatile DWORD last_feed_tick; // last FF_Process call (audio liveness gate)
+	volatile BOOL seeking;         // seek catch-up in progress (show black meanwhile)
 };
 static VIDEO video;
 
@@ -680,6 +686,8 @@ static void video_tick()
 		}
 		video_render_frame(); // scale into video.dib (under lock); sets have_new
 		shown_pts = video.frame_pts;
+		if (video.seeking) video.seeking = FALSE; // a shown frame is within the
+		                                         // clock window - catch-up done
 		video.have_frame = FALSE;
 		break; // one present per tick is enough
 	}
@@ -936,6 +944,7 @@ static void video_attach(FFMPEG *f)
 	video.sar = av_guess_sample_aspect_ratio(f->fmt, f->fmt->streams[f->vstream], NULL);
 	video.have_new = FALSE;
 	video.vis_blank = FALSE;
+	video.seeking = FALSE; // fresh track: not in a seek catch-up
 	video.active = TRUE;
 	LeaveCriticalSection(&video.lock);
 	video_window_init(); // make sure the decoder thread is alive
@@ -1006,6 +1015,20 @@ static BOOL WINAPI FF_VisRenderDC(HDC dc, SIZE size, DWORD flags)
 			return TRUE;
 		}
 		return FALSE;
+	}
+
+	// seek catch-up in progress: keep the area black so the stale frame from
+	// before the seek doesn't linger; the render thread clears `seeking` the
+	// moment it shows a frame within the target window
+	{
+		BOOL s;
+		EnterCriticalSection(&video.lock);
+		s = video.seeking;
+		LeaveCriticalSection(&video.lock);
+		if (s) {
+			FillRect(dc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
+			return TRUE;
+		}
 	}
 
 	// playing: the display is live again, so the blank latch is stale
@@ -1261,6 +1284,49 @@ static DWORD WINAPI FF_Process(float *buffer, DWORD count)
 	int ch = f->dec->ch_layout.nb_channels;
 	if (ch < 1) ch = 1;
 
+	// deferred seek fast-forward (set by FF_SetPosition): skip packets up to
+	// the seek target so audio + video start AT the target, not at the (often
+	// far behind) keyframe. Audio packets are skipped (the decoder was
+	// flushed), video packets enqueued for the render thread's quick
+	// drop-catch-up. Bounded per call; on EAGAIN (m3u8 still downloading) the
+	// fast-forward simply resumes on the next call.
+	if (f->ff_target > 0 && !f->sent_eof && !f->eof) {
+		double t = f->ff_target;
+		if (video.active && f->vstream >= 0) {
+			int guard = 0;
+			while (guard++ < 400) {
+				int rr = av_read_frame(f->fmt, f->pkt);
+				if (rr < 0) {
+					if (rr == AVERROR(EAGAIN)) break; // still downloading: retry next call
+					f->ff_target = 0; // real EOF: give up the fast-forward
+					break;
+				}
+				int si = f->pkt->stream_index;
+				double cur = -1;
+				BOOL saw_pts = FALSE;
+				if (f->pkt->pts != AV_NOPTS_VALUE) {
+					cur = (double)f->pkt->pts * av_q2d(f->fmt->streams[si]->time_base);
+					saw_pts = TRUE;
+				}
+				if (guard == 1 && !saw_pts) { // no timestamps at all: can't fast-forward
+					av_packet_unref(f->pkt);
+					f->ff_target = 0;
+					break;
+				}
+				if (si == f->vstream) {
+					AVPacket *vp = av_packet_alloc();
+					if (vp) { av_packet_move_ref(vp, f->pkt); video_enqueue(vp); }
+					else av_packet_unref(f->pkt);
+				} else {
+					av_packet_unref(f->pkt); // audio before the target: skip
+				}
+				if (cur >= t) { f->ff_target = 0; break; } // reached the target
+			}
+		} else {
+			f->ff_target = 0; // audio-only track: the demuxer seeks exactly, nothing to skip
+		}
+	}
+
 	while (done < count) {
 		if (f->outp < f->outlen) { // staged samples available
 			DWORD n = count - done;
@@ -1377,7 +1443,9 @@ static DWORD WINAPI FF_Process(float *buffer, DWORD count)
 				AVPacket *keep = av_packet_alloc();
 				if (keep) { av_packet_move_ref(keep, f->pkt); f->pend_a[f->pend_n++] = keep; }
 				else av_packet_unref(f->pkt);
-				break; // held for the drain path; stop this pass
+				// held in pend (drained by the main loop) - keep topping up
+				// the video queue; the loop condition caps pend at 8
+				continue;
 			}
 			av_packet_unref(f->pkt); // send error: drop it
 		}
@@ -1430,8 +1498,26 @@ static double WINAPI FF_SetPosition(DWORD pos)
 	f->demux_eof = FALSE;
 	for (int i = 0; i < 8; i++) if (f->pend_a[i]) av_packet_free(&f->pend_a[i]); // pre-seek packets are stale
 	f->pend_n = 0;
+
+	// Clear the stale video queue + flush the video decoder (safe under
+	// demux_lock: video_flush only takes video.lock, the established order).
+	video_flush();
+	{
+		EnterCriticalSection(&video.lock);
+		video.seeking = TRUE; // show black until the catch-up reaches the target
+		LeaveCriticalSection(&video.lock);
+	}
+
+	// av_seek_frame lands on the keyframe <= t, which can be seconds (large
+	// GOP) to tens of seconds (m3u8) behind t. Starting from there would make
+	// audio + video crawl forward in real time, the picture lagging the clock
+	// by that gap (the "像掉帧又不像" judder). Instead the AUDIO thread
+	// fast-forwards the demuxer to t on its next call (f->ff_target - deferred
+	// so a network download never blocks this UI thread): it reads + skips
+	// audio packets, enqueues video packets so the render thread decodes +
+	// drops them up to t quickly, and both streams then start AT the target.
+	f->ff_target = t;
 	LeaveCriticalSection(&demux_lock);
-	video_flush(); // reposition the video too
 	video_clock_capture(t);
 	f->pos = t;
 	return t;
