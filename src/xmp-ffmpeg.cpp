@@ -20,8 +20,11 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <ctype.h>
 
+#include <winsock2.h>
 #include <windows.h>
+#include <wchar.h>
 #include "xmpin.h"
 
 extern "C" {
@@ -45,7 +48,10 @@ static XMPFUNC_MISC   *xmpfmisc;
 static XMPFUNC_FILE   *xmpffile;
 static XMPFUNC_TEXT   *xmpftext;
 static XMPFUNC_STATUS *xmpfstatus;
+static XMPFUNC_REGISTRY *xmpfreg;
 static DWORD xmpver;
+static HINSTANCE dllinst;           // our DLL instance (vis config dialog resource)
+static DWORD vis_colors[3];        // skin colors from FF_VisOpen (bg,text1,text2)
 
 struct FFMPEG {
 	XMPFILE file;
@@ -709,6 +715,833 @@ static void video_detach()
 	LeaveCriticalSection(&video.lock);
 }
 
+// ================================================================ lyrics layer
+// LRC lyrics for AUDIO-ONLY tracks, shown in XMPlay's vis area (video tracks
+// keep showing the picture). Sources, in order: a sidecar .lrc next to the
+// file, embedded lyrics tags in the container, and (last resort) a network
+// lyrics service. The network fetch runs on its own Winsock thread so it never
+// blocks the audio path; results are committed only if the track generation
+// still matches (a close/switch discards in-flight work).
+
+// ------------------------------------------------------------------ settings
+// Persisted through XMPlay's registry face under section "FFmpeg video".
+#define LRC_REGSEC "FFmpeg video"
+struct LRC_CFG {
+	char service[256];  // lyrics service base URL
+	int  use_service;   // download from the service when no local lyrics
+	int  save_sidecar;  // save downloaded lyrics as a .lrc next to the track
+	DWORD cur_color;    // 0xRRGGBB, colour of the active line
+	char font_name[64];
+	int  font_size;     // pixel height
+};
+static LRC_CFG lrc_cfg;
+static void bcpy(char *dst, size_t dstn, const char *src); // forward (defn below)
+
+static void lrc_cfg_defaults()
+{
+	static const LRC_CFG d = { "http://lrc.8od.top:88", 1, 1, 0x00ff88, "SimSun", 18 };
+	lrc_cfg = d;
+}
+static void lrc_cfg_load()
+{
+	lrc_cfg_defaults();
+	if (!xmpfreg) return;
+	{ char buf[256]; if (xmpfreg->GetString(LRC_REGSEC, "ServiceURL", buf, sizeof buf)) bcpy(lrc_cfg.service, sizeof lrc_cfg.service, buf); }
+	int v;
+	if (xmpfreg->GetInt(LRC_REGSEC, "UseService", &v))  lrc_cfg.use_service  = v ? 1 : 0;
+	if (xmpfreg->GetInt(LRC_REGSEC, "SaveSidecar", &v)) lrc_cfg.save_sidecar = v ? 1 : 0;
+	if (xmpfreg->GetInt(LRC_REGSEC, "CurColor", &v))    lrc_cfg.cur_color    = (DWORD)v;
+	{ char buf[64]; if (xmpfreg->GetString(LRC_REGSEC, "FontName", buf, sizeof buf)) bcpy(lrc_cfg.font_name, sizeof lrc_cfg.font_name, buf); }
+	if (xmpfreg->GetInt(LRC_REGSEC, "FontSize", &v) && v >= 8 && v <= 72) lrc_cfg.font_size = v;
+}
+static void lrc_cfg_save()
+{
+	if (!xmpfreg) return;
+	xmpfreg->SetString(LRC_REGSEC, "ServiceURL", lrc_cfg.service);
+	{ int v = lrc_cfg.use_service  ? 1 : 0; xmpfreg->SetInt(LRC_REGSEC, "UseService", &v); }
+	{ int v = lrc_cfg.save_sidecar ? 1 : 0; xmpfreg->SetInt(LRC_REGSEC, "SaveSidecar", &v); }
+	{ int v = (int)lrc_cfg.cur_color;         xmpfreg->SetInt(LRC_REGSEC, "CurColor", &v); }
+	xmpfreg->SetString(LRC_REGSEC, "FontName", lrc_cfg.font_name);
+	xmpfreg->SetInt(LRC_REGSEC, "FontSize", &lrc_cfg.font_size);
+}
+
+// -------------------------------------------------------------- lyrics store
+typedef struct { double t; char *text; } LrcLine; // text = UTF-8, heap
+
+struct LYRIC {
+	CRITICAL_SECTION lock;
+	LrcLine *lines;
+	int nlines;
+	int state;          // 0 = none, 1 = fetching, 2 = ready
+	volatile DWORD gen; // bumped on every open/close; stale fetches are dropped
+};
+static LYRIC lyric;
+static CRITICAL_SECTION lyric_thread_lock; // guards spawn/handle
+static HANDLE lyric_fetch_thread;
+
+static char *xstrdup(const char *s)
+{
+	size_t n = strlen(s) + 1;
+	char *p = (char*)malloc(n);
+	if (p) memcpy(p, s, n);
+	return p;
+}
+// bounded copy (MinGW lacks MSVC's strcpy_s); dst must be NUL-terminated
+static void bcpy(char *dst, size_t dstn, const char *src)
+{
+	if (dstn == 0) return;
+	strncpy(dst, src, dstn - 1);
+	dst[dstn - 1] = 0;
+}
+static void lrc_free_lines(LrcLine *lines, int n)
+{
+	for (int i = 0; i < n; i++) free(lines[i].text);
+	free(lines);
+}
+
+// ------------------------------------------------------------- LRC text parse
+// parse one leading "[mm:ss.xx]" timestamp; s must point at '['. Returns the
+// number of chars consumed (including the closing ']'), 0 if not a timestamp.
+static int lrc_ts_at(const char *s, double *t)
+{
+	if (s[0] != '[') return 0;
+	const char *end = s + 1;
+	while (*end && *end != ']') end++;
+	if (*end != ']') return 0;
+	const char *p = s + 1;
+	int mm = 0, ss = 0, frac = 0, nm = 0, ns = 0, nf = 0;
+	while (*p >= '0' && *p <= '9' && nm < 3) { mm = mm * 10 + (*p - '0'); p++; nm++; }
+	if (!nm || *p != ':') return 0;
+	p++;
+	while (*p >= '0' && *p <= '9' && ns < 2) { ss = ss * 10 + (*p - '0'); p++; ns++; }
+	if (!ns) return 0;
+	if (*p == '.' || *p == ':') {
+		p++;
+		while (*p >= '0' && *p <= '9' && nf < 3) { frac = frac * 10 + (*p - '0'); p++; nf++; }
+	}
+	double fracsec = 0;
+	if (nf == 1) fracsec = frac / 10.0;
+	else if (nf == 2) fracsec = frac / 100.0;
+	else if (nf == 3) fracsec = frac / 1000.0;
+	*t = mm * 60.0 + ss + fracsec;
+	return (int)(end - s) + 1;
+}
+static int looks_like_lrc(const char *v)
+{
+	const char *p = v;
+	while ((p = strchr(p, '['))) {
+		if (p[1] >= '0' && p[1] <= '9' && p[2] >= '0' && p[2] <= '9' && p[3] == ':') return 1;
+		p++;
+	}
+	return 0;
+}
+// Parse LRC text into a heap line array. Returns the line count (0 = none).
+static int lrc_parse(const char *text, LrcLine **out)
+{
+	LrcLine *lines = 0;
+	int n = 0, cap = 0;
+	const char *s = text;
+	while (*s) {
+		const char *nl = strchr(s, '\n');
+		int len = nl ? (int)(nl - s) : (int)strlen(s);
+		char *line = (char*)malloc(len + 1);
+		if (line) {
+			memcpy(line, s, len);
+			line[len] = 0;
+			if (len && line[len - 1] == '\r') line[len - 1] = 0;
+			// collect the leading [mm:ss.xx] tags (a line may carry several)
+			const char *p = line;
+			double ts[16];
+			int nts = 0;
+			while (*p == '[' && nts < 16) {
+				double t;
+				int c = lrc_ts_at(p, &t);
+				if (!c) break;
+				ts[nts++] = t;
+				p += c;
+			}
+			if (nts) {
+				// the text is what follows the tags; strip inline <mm:ss.xx>
+				char *w = (char*)malloc(strlen(p) + 1);
+				if (w) {
+					char *o = w;
+					while (*p) {
+						if (*p == '<') {
+							const char *g = strchr(p, '>');
+							if (g) { p = g + 1; continue; }
+						}
+						*o++ = *p++;
+					}
+					*o = 0;
+					while (*o == ' ' || *o == '\t') o++;        // ltrim
+					char *b = o + strlen(o);
+					while (b > o && (b[-1] == ' ' || b[-1] == '\t')) b--; // rtrim
+					*b = 0;
+					if (*o) {
+						for (int k = 0; k < nts; k++) {
+							if (n == cap) {
+								cap = cap ? cap * 2 : 16;
+								lines = (LrcLine*)realloc(lines, cap * sizeof(LrcLine));
+								if (!lines) { free(w); lrc_free_lines(lines, n); *out = 0; return 0; }
+							}
+							lines[n].t = ts[k];
+							lines[n].text = xstrdup(o);
+							if (!lines[n].text) { lrc_free_lines(lines, n); *out = 0; return 0; }
+							n++;
+						}
+					}
+					free(w);
+				}
+			}
+			free(line);
+		}
+		if (!nl) break;
+		s = nl + 1;
+	}
+	*out = lines;
+	return n;
+}
+
+// --------------------------------------------------------- UTF-8 <-> UTF-16-LE
+// the service encodes artist/title as UTF-16-LE bytes hex-doubled
+static char *utf8_to_hex16le(const char *utf8)
+{
+	if (!utf8 || !*utf8) return xstrdup("");
+	int wn = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, 0, 0);
+	if (wn < 1) return xstrdup("");
+	wchar_t *w = (wchar_t*)malloc(wn * sizeof(wchar_t));
+	if (!w) return 0;
+	MultiByteToWideChar(CP_UTF8, 0, utf8, -1, w, wn);
+	// on x86 wchar_t is 16-bit little-endian; hex the raw bytes (drop the
+	// trailing NUL wide char). Cap the number of chars so the hex (and the
+	// URLs built from it) stay bounded - artist/title are short in practice.
+	int chars = wn - 1;
+	if (chars > 64) chars = 64;
+	char *h = (char*)malloc(chars * 4 + 1);
+	if (!h) { free(w); return 0; }
+	for (int i = 0; i < chars; i++) {
+		unsigned short u = (unsigned short)w[i];
+		sprintf(h + i * 4, "%02x%02x", (unsigned)(u & 0xff), (unsigned)((u >> 8) & 0xff));
+	}
+	h[chars * 4] = 0;
+	free(w);
+	return h;
+}
+
+// ------------------------------------------------------------- HTTP GET (WS)
+static volatile LONG ws_init_done = 0;
+static void ws_ensure(void)
+{
+	if (InterlockedCompareExchange(&ws_init_done, 1, 0) == 0) {
+		WSADATA d;
+		WSAStartup(MAKEWORD(2, 2), &d);
+	}
+}
+static int ci_contains(const char *h, const char *needle)
+{
+	size_t nl = strlen(needle);
+	for (const char *p = h; *p; p++) {
+		int ok = 1;
+		for (size_t i = 0; i < nl; i++)
+			if (toupper((unsigned char)p[i]) != toupper((unsigned char)needle[i])) { ok = 0; break; }
+		if (ok) return 1;
+	}
+	return 0;
+}
+// fetch a URL with plain Winsock. Returns a malloc'd body (NUL-terminated,
+// headers stripped, chunked decoded) or 0 on any failure. Bounded work, 8s
+// socket timeouts, ~2MB cap.
+static char *http_get(const char *url)
+{
+	ws_ensure();
+	char host[256], path[1024];
+	int port = 0;
+	const char *p = url;
+	if (strncmp(p, "http://", 7) == 0) p += 7;
+	else if (strncmp(p, "https://", 8) == 0) return 0; // no TLS on XP
+	{
+		const char *h = p;
+		char *ho = host;
+		int hi = 0;
+		while (*h && *h != '/' && *h != ':' && hi < (int)sizeof host - 1) ho[hi++] = *h++;
+		ho[hi] = 0;
+		port = 80;
+		if (*h == ':') {
+			h++;
+			port = atoi(h);
+			while (*h && *h != '/') h++;
+		}
+		bcpy(path, sizeof path, h);
+		if (!host[0] || !port || !path[0]) return 0;
+	}
+	struct addrinfo hints, *res = 0;
+	memset(&hints, 0, sizeof hints);
+	hints.ai_family = AF_INET;
+	hints.ai_socktype = SOCK_STREAM;
+	hints.ai_protocol = IPPROTO_TCP;
+	char pstr[16];
+	sprintf(pstr, "%d", port);
+	if (getaddrinfo(host, pstr, &hints, &res) != 0) return 0;
+	SOCKET s = INVALID_SOCKET;
+	for (struct addrinfo *a = res; a; a = a->ai_next) {
+		s = socket(a->ai_family, a->ai_socktype, a->ai_protocol);
+		if (s == INVALID_SOCKET) continue;
+		if (connect(s, a->ai_addr, (int)a->ai_addrlen) == 0) break;
+		closesocket(s);
+		s = INVALID_SOCKET;
+	}
+	freeaddrinfo(res);
+	if (s == INVALID_SOCKET) return 0;
+	{
+		DWORD to = 8000;
+		setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&to, sizeof to);
+		setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&to, sizeof to);
+	}
+	char req[1400];
+	snprintf(req, sizeof req, "GET %s HTTP/1.1\r\nHost: %s:%d\r\nConnection: close\r\n"
+		"User-Agent: xmp-ffmpeg\r\nAccept: */*\r\n\r\n", path, host, port);
+	if (send(s, req, (int)strlen(req), 0) < 0) { closesocket(s); return 0; }
+	char *body = 0;
+	DWORD cap = 0, len = 0;
+	char tmp[4096];
+	while (1) {
+		int r = recv(s, tmp, sizeof tmp, 0);
+		if (r <= 0) break;
+		if (len + (DWORD)r + 1 > cap) {
+			cap = cap ? cap * 2 : 4096;
+			while (cap < len + (DWORD)r + 1) cap *= 2;
+			body = (char*)realloc(body, cap);
+			if (!body) break;
+		}
+		memcpy(body + len, tmp, r);
+		len += r;
+		body[len] = 0;
+		if (len > 2048 * 1024) break;
+	}
+	closesocket(s);
+	if (!body) return 0;
+	char *hdr = body;
+	char *hs = strstr(body, "\r\n\r\n");
+	char *bstart = hs ? hs + 4 : body;
+	if (ci_contains(hdr, "Transfer-Encoding") && ci_contains(hdr, "chunked")) {
+		char *src = bstart, *dst = body;
+		while (*src) {
+			const char *eol = strstr(src, "\r\n");
+			if (!eol) break;
+			int szd = (int)(eol - src);
+			if (szd > 23) szd = 23;
+			char szbuf[32];
+			memcpy(szbuf, src, szd);
+			szbuf[szd] = 0;
+			unsigned cs = (unsigned)strtoul(szbuf, 0, 16);
+			src = eol + 2;
+			if (cs == 0) break;
+			memcpy(dst, src, cs);
+			dst += cs;
+			src += cs;
+			if (src[0] == '\r' && src[1] == '\n') src += 2;
+		}
+		*dst = 0;
+	}
+	return body;
+}
+
+// -------------------------------------------------------- sidecar .lrc helper
+// LRC files on disk are often GBK (Chinese Windows) or UTF-16; normalize to
+// UTF-8 so the parser + GDI wide conversion work on one encoding.
+static char *copy_bytes(const unsigned char *src, size_t n)
+{
+	char *p = (char*)malloc(n + 1);
+	if (p) { memcpy(p, src, n); p[n] = 0; }
+	return p;
+}
+static int looks_utf8(const unsigned char *b, size_t n)
+{
+	size_t i = 0;
+	while (i < n) {
+		unsigned char c = b[i];
+		if (c < 0x80) { i++; continue; }
+		int extra;
+		if (c >= 0xC2 && c <= 0xDF) extra = 1;
+		else if (c >= 0xE0 && c <= 0xEF) extra = 2;
+		else if (c >= 0xF0 && c <= 0xF4) extra = 3;
+		else return 0;
+		if (i + (size_t)extra >= n) return 0;
+		for (int k = 1; k <= extra; k++) if ((b[i + k] & 0xC0) != 0x80) return 0;
+		i += 1 + extra;
+	}
+	return 1;
+}
+static char *utf16_to_utf8(const unsigned char *bytes, size_t bytelen, int is_be)
+{
+	wchar_t *w = (wchar_t*)malloc((bytelen / 2 + 1) * sizeof(wchar_t));
+	if (!w) return 0;
+	for (size_t i = 0; i + 1 < bytelen; i += 2)
+		w[i / 2] = is_be ? ((wchar_t)bytes[i] << 8) | bytes[i + 1]
+		: ((wchar_t)bytes[i + 1] << 8) | bytes[i];
+	w[bytelen / 2] = 0;
+	int outc = WideCharToMultiByte(CP_UTF8, 0, w, (int)(bytelen / 2), 0, 0, 0, 0);
+	char *out = 0;
+	if (outc > 0) {
+		out = (char*)malloc(outc + 1);
+		if (out) WideCharToMultiByte(CP_UTF8, 0, w, (int)(bytelen / 2), out, outc, 0, 0);
+	}
+	free(w);
+	if (out && out[0]) return out;
+	free(out);
+	return 0;
+}
+static char *cp936_to_utf8(const unsigned char *bytes, size_t bytelen)
+{
+	int wlen = MultiByteToWideChar(CP_936, 0, (const char*)bytes, (int)bytelen, 0, 0);
+	if (wlen < 0) return 0;
+	wchar_t *w = (wchar_t*)malloc((wlen + 1) * sizeof(wchar_t));
+	if (!w) return 0;
+	MultiByteToWideChar(CP_936, 0, (const char*)bytes, (int)bytelen, w, wlen);
+	int outc = WideCharToMultiByte(CP_UTF8, 0, w, wlen, 0, 0, 0, 0);
+	char *out = 0;
+	if (outc > 0) {
+		out = (char*)malloc(outc + 1);
+		if (out) WideCharToMultiByte(CP_UTF8, 0, w, wlen, out, outc, 0, 0);
+	}
+	free(w);
+	return out;
+}
+// normalize arbitrary LRC bytes to a heap UTF-8 string (or 0 on failure)
+static char *lrc_to_utf8(const unsigned char *raw, size_t len)
+{
+	if (len >= 3 && raw[0] == 0xEF && raw[1] == 0xBB && raw[2] == 0xBF)
+		return copy_bytes(raw + 3, len - 3);                       // UTF-8 BOM
+	if (len >= 2 && raw[0] == 0xFF && raw[1] == 0xFE)
+		return utf16_to_utf8(raw + 2, len - 2, 0);                 // UTF-16LE BOM
+	if (len >= 2 && raw[0] == 0xFE && raw[1] == 0xFF)
+		return utf16_to_utf8(raw + 2, len - 2, 1);                 // UTF-16BE BOM
+	{ // no BOM: mostly-NUL -> UTF-16LE
+		int nul = 0, nonnul = 0;
+		for (size_t i = 0; i < len; i++) (raw[i] == 0) ? nul++ : nonnul++;
+		if (nul > 0 && nul >= nonnul) return utf16_to_utf8(raw, len, 0);
+	}
+	if (looks_utf8(raw, len)) return copy_bytes(raw, len);          // plain UTF-8
+	return cp936_to_utf8(raw, len);                                  // else GBK/CP936
+}
+static wchar_t *utf8_path_to_wide(const char *s)
+{
+	int wn = MultiByteToWideChar(CP_UTF8, 0, s, -1, 0, 0);
+	if (wn < 1) return 0;
+	wchar_t *w = (wchar_t*)malloc(wn * sizeof(wchar_t));
+	if (!w) return 0;
+	MultiByteToWideChar(CP_UTF8, 0, s, -1, w, wn);
+	return w;
+}
+// build "<dir>/<base>.lrc" for a local file path; returns a heap wide path or 0.
+static wchar_t *sidecar_wide_path(const char *filename_utf8)
+{
+	wchar_t *wf = utf8_path_to_wide(filename_utf8);
+	if (!wf) return 0;
+	size_t n = wcslen(wf);
+	wchar_t *side = (wchar_t*)malloc((n + 8) * sizeof(wchar_t));
+	if (!side) { free(wf); return 0; }
+	wcscpy(side, wf);
+	// strip the extension: find the last '.' that sits after the last path sep
+	wchar_t *base = side + n;
+	while (base > side && *base != L'\\' && *base != L'/') base--;
+	wchar_t *dot = 0;
+	for (wchar_t *q = base + 1; *q; q++) if (*q == L'.') dot = q;
+	if (dot) *dot = 0; // no extension -> nothing stripped, name kept as-is
+	wcscat(side, L".lrc");
+	free(wf);
+	return side;
+}
+static char *read_sidecar(const char *filename_utf8)
+{
+	wchar_t *wp = sidecar_wide_path(filename_utf8);
+	if (!wp) return 0;
+	FILE *f = _wfopen(wp, L"rb");
+	free(wp);
+	if (!f) return 0;
+	if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return 0; }
+	long sz = ftell(f);
+	rewind(f);
+	if (sz < 0) { fclose(f); return 0; }
+	unsigned char *raw = (unsigned char*)malloc((size_t)sz);
+	if (!raw) { fclose(f); return 0; }
+	size_t rd = fread(raw, 1, (size_t)sz, f);
+	fclose(f);
+	char *utf8 = lrc_to_utf8(raw, rd);
+	free(raw);
+	if (!utf8 || !looks_like_lrc(utf8)) { free(utf8); return 0; }
+	return utf8;
+}
+static void save_sidecar(const char *filename_utf8, const char *lrc_text)
+{
+	wchar_t *wp = sidecar_wide_path(filename_utf8);
+	if (!wp) return;
+	FILE *f = _wfopen(wp, L"wb");
+	free(wp);
+	if (!f) return;
+	fwrite(lrc_text, 1, strlen(lrc_text), f);
+	fclose(f);
+}
+static char *read_embedded(FFMPEG *f)
+{
+	const char *keys[] = { "LYRICS", "lyrics", "unsynced_lyrics", "SYNCLRC", "comment" };
+	AVDictionary *md[2] = { f->fmt->metadata, f->fmt->streams[f->stream]->metadata };
+	for (int i = 0; i < 2; i++) {
+		if (!md[i]) continue;
+		for (unsigned k = 0; k < sizeof(keys) / sizeof(keys[0]); k++) {
+			AVDictionaryEntry *e = av_dict_get(md[i], keys[k], 0, 0);
+			if (e && e->value && e->value[0] && looks_like_lrc(e->value)) return xstrdup(e->value);
+		}
+	}
+	return 0;
+}
+
+// ------------------------------------------------------------- fetch thread
+// tiny XML helpers: the search endpoint returns <lrc id="N" artist=".."
+// title=".." type=".."/> lines; we score candidates against the requested
+// artist/title so a DJ/cover version doesn't win over the right song.
+static int xml_attr(const char *region, const char *key, char *out, int outc)
+{
+	char pat[64];
+	snprintf(pat, sizeof pat, "%s=\"", key);
+	const char *p = strstr(region, pat);
+	if (!p) return 0;
+	p += strlen(pat);
+	const char *end = strchr(p, '"');
+	int n = end ? (int)(end - p) : (int)strlen(p);
+	if (n >= outc) n = outc - 1;
+	memcpy(out, p, n);
+	out[n] = 0;
+	return n > 0;
+}
+static int ci_eq_str(const char *a, const char *b)
+{
+	if (!a) a = "";
+	if (!b) b = "";
+	size_t la = strlen(a), lb = strlen(b);
+	if (la != lb) return 0;
+	for (size_t i = 0; i < la; i++)
+		if (toupper((unsigned char)a[i]) != toupper((unsigned char)b[i])) return 0;
+	return 1;
+}
+static int ci_contains_str(const char *hay, const char *needle)
+{
+	if (!hay || !needle || !*needle) return 0;
+	size_t nl = strlen(needle);
+	const char *p = hay;
+	while (*p) {
+		if (strlen(p) >= nl) {
+			int ok = 1;
+			for (size_t i = 0; i < nl; i++)
+				if (toupper((unsigned char)p[i]) != toupper((unsigned char)needle[i])) { ok = 0; break; }
+			if (ok) return 1;
+		}
+		p++;
+	}
+	return 0;
+}
+
+typedef struct {
+	char service[256];
+	char artist[512];
+	char title[512];
+	char filename[1024];
+	int use_service;
+	int save_sidecar;
+	DWORD gen;
+} LyricFetchCtx;
+
+static DWORD WINAPI lyric_fetch_thread(LPVOID arg)
+{
+	LyricFetchCtx *c = (LyricFetchCtx*)arg;
+	DWORD gen = c->gen;
+	char *lrc_text = 0;
+	// search: artist+title -> best candidate id (need at least one to search by)
+	if (c->artist[0] || c->title[0]) {
+		char *ah = utf8_to_hex16le(c->artist);
+		char *th = utf8_to_hex16le(c->title);
+		if (ah && th) {
+			char url[4096];
+			snprintf(url, sizeof url, "%s/?sh?Artist=%s&Title=%s", c->service, ah, th);
+			logmsg("lrc: search %s", url);
+			char *xml = http_get(url);
+			if (xml) {
+				// score every <lrc> candidate against the requested title/artist
+				int best = -1;
+				double best_score = -1;
+				const char *s = xml;
+				while ((s = strstr(s, "<lrc "))) {
+					const char *tagend = strchr(s, '>');
+					if (!tagend) break;
+					char region[1024];
+					int rlen = (int)(tagend - s);
+					if (rlen >= (int)sizeof region) rlen = sizeof region - 1;
+					memcpy(region, s, rlen);
+					region[rlen] = 0;
+					char idbuf[16], abuf[256], tbuf[256];
+					int id = 0;
+					if (xml_attr(region, "id", idbuf, sizeof idbuf)) id = atoi(idbuf);
+					xml_attr(region, "artist", abuf, sizeof abuf);
+					xml_attr(region, "title", tbuf, sizeof tbuf);
+					if (id > 0) {
+						double score = 0;
+						if (ci_eq_str(tbuf, c->title)) score += 10;
+						else if (ci_contains_str(tbuf, c->title) ||
+						         (c->title[0] && ci_contains_str(c->title, tbuf))) score += 3;
+						if (c->artist[0] &&
+							(ci_contains_str(abuf, c->artist) || ci_contains_str(c->artist, abuf)))
+							score += 5;
+						if (score > best_score) { best_score = score; best = id; }
+					}
+					s = tagend + 1;
+				}
+				if (best > 0) {
+					char dlurl[600];
+					snprintf(dlurl, sizeof dlurl, "%s/?dl?Id=%d&Code=1", c->service, best);
+					logmsg("lrc: download id=%d (score=%.0f)", best, best_score);
+					char *body = http_get(dlurl);
+					if (body && looks_like_lrc(body)) lrc_text = body;
+					else free(body);
+				}
+				free(xml);
+			}
+			free(ah);
+			free(th);
+		}
+	}
+	EnterCriticalSection(&lyric.lock);
+	BOOL fresh = (lyric.gen == gen);
+	if (fresh && lrc_text) {
+		lrc_free_lines(lyric.lines, lyric.nlines);
+		lyric.lines = 0;
+		lyric.nlines = 0;
+		lyric.nlines = lrc_parse(lrc_text, &lyric.lines);
+		lyric.state = lyric.nlines > 0 ? 2 : 0;
+		if (lyric.nlines > 0 && c->save_sidecar && !strstr(c->filename, "://"))
+			save_sidecar(c->filename, lrc_text);
+		logmsg("lrc: ready lines=%d state=%d", lyric.nlines, lyric.state);
+	} else {
+		logmsg("lrc: fetch stale, dropped");
+	}
+	LeaveCriticalSection(&lyric.lock);
+	free(lrc_text);
+	free(c);
+	// keep the handle valid until the next spawn reuses/closes it
+	return 0;
+}
+
+// Kick off lyric loading for an audio-only track. Sidecar + embedded are read
+// synchronously (fast, local); only the service download goes to a thread.
+static void lyric_start(FFMPEG *f, const char *filename, const char *artist, const char *title, BOOL is_local)
+{
+	EnterCriticalSection(&lyric.lock);
+	lyric.gen++;
+	DWORD gen = lyric.gen;
+	lrc_free_lines(lyric.lines, lyric.nlines);
+	lyric.lines = 0;
+	lyric.nlines = 0;
+	lyric.state = 0;
+	LeaveCriticalSection(&lyric.lock);
+
+	char *text = 0;
+	if (is_local) text = read_sidecar(filename);
+	if (!text) text = read_embedded(f);
+	if (text) {
+		EnterCriticalSection(&lyric.lock);
+		if (lyric.gen == gen) {
+			lyric.nlines = lrc_parse(text, &lyric.lines);
+			lyric.state = lyric.nlines > 0 ? 2 : 0;
+			logmsg("lrc: local lines=%d", lyric.nlines);
+		}
+		LeaveCriticalSection(&lyric.lock);
+		free(text);
+		return;
+	}
+	if (!lrc_cfg.use_service || !lrc_cfg.service[0]) return;
+	// spawn the network fetch (only one in flight; a stale one drops its result)
+	EnterCriticalSection(&lyric_thread_lock);
+	LyricFetchCtx *c = (LyricFetchCtx*)calloc(1, sizeof(LyricFetchCtx));
+	if (c) {
+		bcpy(c->service, sizeof c->service, lrc_cfg.service);
+		if (artist) bcpy(c->artist, sizeof c->artist, artist);
+		if (title) bcpy(c->title, sizeof c->title, title);
+		if (filename) bcpy(c->filename, sizeof c->filename, filename);
+		c->use_service = lrc_cfg.use_service;
+		c->save_sidecar = lrc_cfg.save_sidecar && is_local ? 1 : 0;
+		c->gen = gen;
+		EnterCriticalSection(&lyric.lock);
+		lyric.state = 1; // fetching
+		LeaveCriticalSection(&lyric.lock);
+		HANDLE h = CreateThread(0, 0, lyric_fetch_thread, c, 0, 0);
+		if (h) {
+			HANDLE old = lyric_fetch_thread;
+			lyric_fetch_thread = h;
+			// close the previous handle only after we've handed off; the thread
+			// object outlives the handle, so closing the old one is safe
+			if (old) CloseHandle(old);
+		} else {
+			free(c);
+			EnterCriticalSection(&lyric.lock);
+			lyric.state = 0;
+			LeaveCriticalSection(&lyric.lock);
+		}
+	}
+	LeaveCriticalSection(&lyric_thread_lock);
+}
+
+// called on Close: invalidate any in-flight/finished lyrics for this track
+static void lyric_invalidate()
+{
+	EnterCriticalSection(&lyric.lock);
+	lyric.gen++;
+	lrc_free_lines(lyric.lines, lyric.nlines);
+	lyric.lines = 0;
+	lyric.nlines = 0;
+	lyric.state = 0;
+	LeaveCriticalSection(&lyric.lock);
+}
+
+// --------------------------------------------------------------- vis renderer
+static HFONT lrc_font;
+static char lrc_font_cache[64];
+static int lrc_font_cache_size = -1;
+
+static int lyric_render(HDC dc, int W, int H)
+{
+	// returns 1 if lyrics were drawn, 0 otherwise (caller falls back to black)
+	double t = video_clock_now();
+	const char *texts[32];
+	int n = 0;
+	int cur = -1;
+	{
+		EnterCriticalSection(&lyric.lock);
+		if (lyric.state == 2 && lyric.nlines > 0) {
+			for (int i = 0; i < lyric.nlines && i < 32; i++) {
+				if (t >= lyric.lines[i].t) cur = i;
+				else break;
+			}
+			if (cur < 0) cur = 0;
+			int i0 = cur - 1;
+			if (i0 < 0) i0 = 0;
+			for (int i = i0; i < lyric.nlines && n < 32; i++) {
+				texts[n] = lyric.lines[i].text;
+				n++;
+			}
+		}
+		LeaveCriticalSection(&lyric.lock);
+	}
+	if (cur < 0 || n == 0) return 0;
+
+	// rebuild the font if the config changed
+	{
+		BOOL changed = (lrc_font_cache_size != lrc_cfg.font_size);
+		if (!changed) {
+			int len = (int)strlen(lrc_cfg.font_name);
+			if (len >= (int)sizeof lrc_font_cache) changed = 1;
+			else if (len != (int)strlen(lrc_font_cache)) changed = 1;
+			else for (int i = 0; i < len; i++) if (lrc_font_cache[i] != lrc_cfg.font_name[i]) { changed = 1; break; }
+		}
+		if (changed) {
+			bcpy(lrc_font_cache, sizeof lrc_font_cache, lrc_cfg.font_name);
+			lrc_font_cache_size = lrc_cfg.font_size;
+			if (lrc_font) DeleteObject(lrc_font);
+			wchar_t fn[64];
+			MultiByteToWideChar(CP_UTF8, 0, lrc_cfg.font_name, -1, fn, 64);
+			lrc_font = CreateFontW(-(lrc_cfg.font_size), 0, 0, 0, FW_NORMAL, FALSE, FALSE, 0,
+				DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
+				DEFAULT_PITCH | FF_DONTCARE, fn);
+			if (!lrc_font) lrc_font = CreateFontW(-lrc_cfg.font_size, 0, 0, 0, FW_NORMAL, 0, 0, 0,
+				DEFAULT_CHARSET, 0, 0, DEFAULT_QUALITY, DEFAULT_PITCH, L"Tahoma");
+		}
+	}
+
+	int lh = lrc_cfg.font_size + 6; // line height in px
+	int rows = H / lh;
+	if (rows < 3) rows = 3;
+	if (rows > 12) rows = 12;
+	int currow = rows / 2;          // current line sits mid-panel, lines scroll up
+	int bg = (int)vis_colors[0];
+	int txt = (int)vis_colors[1];
+	int R = (bg >> 16) & 0xff, G = (bg >> 8) & 0xff, B = bg & 0xff;
+	int tr = (txt >> 16) & 0xff, tg = (txt >> 8) & 0xff, tb = txt & 0xff;
+	int dr = R + (tr - R) / 2, dg = G + (tg - G) / 2, db = B + (tb - B) / 2; // dimmed
+	HFONT oldf = (HFONT)SelectObject(dc, lrc_font);
+	HPEN oldpen = (HPEN)SelectObject(dc, GetStockObject(NULL_PEN));
+	HGDIOBJ oldbr = SelectObject(dc, GetStockObject(NULL_BRUSH));
+	for (int r = 0; r < rows; r++) {
+		int li = cur - currow + r;
+		if (li < 0 || li >= n) continue;
+		wchar_t wtext[512];
+		MultiByteToWideChar(CP_UTF8, 0, texts[li], -1, wtext, 512);
+		RECT rc = { 0, r * lh, W, r * lh + lh };
+		COLORREF cr = (r == currow) ? (COLORREF)lrc_cfg.cur_color : RGB(dr, dg, db);
+		SetTextColor(dc, cr);
+		SetBkMode(dc, TRANSPARENT);
+		DrawTextW(dc, wtext, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+	}
+	SelectObject(dc, oldf);
+	SelectObject(dc, oldpen);
+	SelectObject(dc, oldbr);
+	return 1;
+}
+
+// ---------------------------------------------------------------- vis config
+static HWND lrc_confwin;
+
+BOOL CALLBACK LrcConfigDialogProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+	switch (m) {
+	case WM_INITDIALOG:
+		lrc_confwin = h;
+		{
+			POINT p;
+			GetCursorPos(&p);
+			SetWindowPos(h, 0, p.x - 160, p.y - 20, 0, 0,
+				SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE | SWP_NOSIZE);
+		}
+		SetDlgItemText(h, 201, lrc_cfg.service);
+		SendDlgItemMessage(h, 202, BM_SETCHECK, lrc_cfg.use_service ? BST_CHECKED : BST_UNCHECKED, 0);
+		SendDlgItemMessage(h, 203, BM_SETCHECK, lrc_cfg.save_sidecar ? BST_CHECKED : BST_UNCHECKED, 0);
+		{ char b[32]; sprintf(b, "%06X", (unsigned)lrc_cfg.cur_color); SetDlgItemText(h, 204, b); }
+		SetDlgItemText(h, 205, lrc_cfg.font_name);
+		{ char b[16]; sprintf(b, "%d", lrc_cfg.font_size); SetDlgItemText(h, 206, b); }
+		return 1;
+	case WM_COMMAND:
+		switch (LOWORD(w)) {
+		case IDOK:
+		{
+			char buf[256];
+			GetDlgItemText(h, 201, buf, sizeof buf);
+			bcpy(lrc_cfg.service, sizeof lrc_cfg.service, buf);
+			lrc_cfg.use_service  = SendDlgItemMessage(h, 202, BM_GETCHECK, 0, 0) == BST_CHECKED;
+			lrc_cfg.save_sidecar = SendDlgItemMessage(h, 203, BM_GETCHECK, 0, 0) == BST_CHECKED;
+			{ char cb[32]; GetDlgItemText(h, 204, cb, sizeof cb);
+			  if (strlen(cb) == 6) lrc_cfg.cur_color = (DWORD)strtoul(cb, 0, 16); }
+			GetDlgItemText(h, 205, buf, sizeof buf);
+			bcpy(lrc_cfg.font_name, sizeof lrc_cfg.font_name, buf);
+			{ int sz = GetDlgItemInt(h, 206, NULL, TRUE); if (sz >= 8 && sz <= 72) lrc_cfg.font_size = sz; }
+			lrc_cfg_save();
+			EndDialog(h, 1);
+			break;
+		}
+		case IDCANCEL:
+			EndDialog(h, 0);
+			break;
+		}
+		return 1;
+	case WM_DESTROY:
+		lrc_confwin = 0;
+		break;
+	}
+	return 0;
+}
+
+static void WINAPI FF_VisConfig(HWND win)
+{
+	if (lrc_confwin) SetForegroundWindow(lrc_confwin);
+	else DialogBox(dllinst, MAKEINTRESOURCE(1000), win, LrcConfigDialogProc);
+}
+
 // ------------------------------------------------------- XMPlay vis callbacks
 // B2: the video shows in XMPlay's OWN visualisation area. XMPlay opens/closes/
 // fullscreen-s it (VisOpen/VisClose + the area's own double-click); we just
@@ -717,6 +1550,7 @@ static void video_detach()
 static BOOL WINAPI FF_VisOpen(DWORD colors[3])
 {
 	logmsg("vis: open");
+	if (colors) { vis_colors[0] = colors[0]; vis_colors[1] = colors[1]; vis_colors[2] = colors[2]; }
 	video_window_init(); // ensure the decoder thread is alive
 	EnterCriticalSection(&video.lock);
 	video.vis_blank = FALSE; // new track/vis session: refresh resumes
@@ -780,9 +1614,13 @@ static BOOL WINAPI FF_VisRenderDC(HDC dc, SIZE size, DWORD flags)
 	video.vis_blank = FALSE;
 	LeaveCriticalSection(&video.lock);
 
-	// no video stream on this track (audio-only) -> keep it blank
+	// no video stream on this track (audio-only): show the skin background plus
+	// LRC lyrics when we have them (fetching happens on a background thread)
 	if (!video.dib || video.dibw < 1 || !video.vdec) {
-		FillRect(dc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
+		HBRUSH bg = CreateSolidBrush((COLORREF)vis_colors[0]);
+		FillRect(dc, &rc, bg);
+		DeleteObject(bg);
+		lyric_render(dc, size.cx, size.cy); // draws nothing until lyrics are ready
 		return TRUE;
 	}
 
@@ -821,8 +1659,10 @@ static void WINAPI FF_About(HWND win)
 	snprintf(msg, sizeof(msg), "%s %s\n\nPlays any audio format FFmpeg can decode,\n"
 		"including the audio track of video files.\n\n"
 		"Video renders into XMPlay's own visualisation area:\n"
-		"pick \"FFmpeg video\" in the vis menu; XMPlay's vis\n"
-		"controls (open/close/fullscreen) drive the picture.\n\n"
+		"pick \"FFmpeg video / lyrics\" in the vis menu; XMPlay's vis\n"
+		"controls (open/close/fullscreen) drive the picture. Audio-only\n"
+		"tracks show LRC lyrics there instead (sidecar .lrc, embedded\n"
+		"tags, or the configured lyrics service).\n\n"
 		"FFmpeg: %s\nXMPlay plugin interface %u",
 		PLUGIN_NAME, PLUGIN_VER, av_version_info(), (unsigned)XMPIN_FACE);
 	MessageBox(win, msg, "About " PLUGIN_NAME, MB_ICONINFORMATION);
@@ -880,6 +1720,24 @@ static DWORD WINAPI FF_Open(const char *filename, XMPFILE file)
 	if (current->netfile)
 		xmpffile->NetSetRate(file, current->bitrate ? current->bitrate * 125 : 32000);
 	video_attach(current); // attach the vis video iff this file has a video stream
+	if (current->vstream < 0) {
+		// audio-only track: load LRC lyrics (sidecar -> embedded tags -> service)
+		char artist[512] = "", title[512] = "";
+		AVDictionary *md[2] = { current->fmt->metadata,
+			current->fmt->streams[current->stream]->metadata };
+		for (int i = 0; i < 2 && !artist[0]; i++) {
+			if (!md[i]) continue;
+			AVDictionaryEntry *e = av_dict_get(md[i], "artist", 0, 0);
+			if (e && e->value) bcpy(artist, sizeof artist, e->value);
+		}
+		for (int i = 0; i < 2 && !title[0]; i++) {
+			if (!md[i]) continue;
+			AVDictionaryEntry *e = av_dict_get(md[i], "title", 0, 0);
+			if (e && e->value) bcpy(title, sizeof title, e->value);
+		}
+		BOOL is_local = !current->netfile && !(filename && strstr(filename, "://"));
+		lyric_start(current, filename, artist, title, is_local);
+	}
 	// 2 = success and XMPlay may close its file: we did the I/O ourselves
 	// (direct networking / no XMPFILE). This makes XMPlay forward real seek
 	// positions for internet streams (Ian @ un4seen). The earlier HLS-only
@@ -892,6 +1750,7 @@ static void WINAPI FF_Close()
 {
 	logmsg("cb: Close");
 	video_detach(); // stop the render thread before freeing the video decoder
+	lyric_invalidate(); // drop this track's lyrics + any in-flight fetch result
 	EnterCriticalSection(&demux_lock);
 	FFMPEG *f = current;
 	current = 0;
@@ -1006,7 +1865,9 @@ static DWORD WINAPI FF_Process(float *buffer, DWORD count)
 	// audio device buffer (~0.4s here, and it wobbles 0.1->0.4 right after
 	// a seek when the buffer drains and refills) - driving the picture off
 	// f->pos makes the video rush ahead of the audio and stutter.
-	if (video.active) video_clock_capture(xmpfstatus ? xmpfstatus->GetTime() : f->pos);
+	// Captured unconditionally now: audio-only tracks need the same clock to
+	// drive the LRC lyrics display.
+	video_clock_capture(xmpfstatus ? xmpfstatus->GetTime() : f->pos);
 	{ // demand + clock heartbeat, 10/sec
 		static DWORD lastbeat;
 		DWORD now = GetTickCount();
@@ -1238,11 +2099,13 @@ static double WINAPI FF_SetPosition(DWORD pos)
 
 	// Clear the stale video queue + flush the video decoder (safe under
 	// demux_lock: video_flush only takes video.lock, the established order).
-	video_flush();
-	{
-		EnterCriticalSection(&video.lock);
-		video.seeking = TRUE; // show black until the catch-up reaches the target
-		LeaveCriticalSection(&video.lock);
+	if (f->vstream >= 0) {
+		video_flush();
+		{
+			EnterCriticalSection(&video.lock);
+			video.seeking = TRUE; // show black until the catch-up reaches the target
+			LeaveCriticalSection(&video.lock);
+		}
 	}
 
 	// av_seek_frame lands on the keyframe <= t, which can be seconds (large
@@ -1298,14 +2161,15 @@ extern "C" __declspec(dllexport) XMPIN *WINAPI XMPIN_GetInterface(DWORD face, In
 		NULL,             // GetSubSongs
 		NULL,
 		NULL,             // GetDownloaded
-		"FFmpeg video",   // visname (B2: video shows in XMPlay's vis area)
+		"FFmpeg video / lyrics", // visname (B2: video shows in XMPlay's vis area;
+		                         // audio-only tracks show LRC lyrics there instead)
 		FF_VisOpen,
 		FF_VisClose,
 		FF_VisSize,
 		FF_VisRender,
 		FF_VisRenderDC,
 		NULL,             // VisButton (fullscreen is the vis area's own double-click)
-		NULL,             // VisConfig ("video mode" toggle - add later)
+		FF_VisConfig,     // vis config dialog (lyrics service / colours / font)
 	};
 
 	if (face != XMPIN_FACE) {
@@ -1321,9 +2185,11 @@ extern "C" __declspec(dllexport) XMPIN *WINAPI XMPIN_GetInterface(DWORD face, In
 	xmpffile  = (XMPFUNC_FILE*)faceproc(XMPFUNC_FILE_FACE);
 	xmpftext  = (XMPFUNC_TEXT*)faceproc(XMPFUNC_TEXT_FACE);
 	xmpfstatus = (XMPFUNC_STATUS*)faceproc(XMPFUNC_STATUS_FACE);
+	xmpfreg   = (XMPFUNC_REGISTRY*)faceproc(XMPFUNC_REGISTRY_FACE);
 	xmpver = xmpfmisc->GetVersion();
 	InitializeCriticalSection(&video.lock);
 	InitializeCriticalSection(&demux_lock);
+	lrc_cfg_load(); // lyrics settings from the registry face (defaults if absent)
 	video.vframe = av_frame_alloc();
 	av_log_set_callback(ff_log_cb);
 	{
@@ -1349,6 +2215,15 @@ BOOL WINAPI DllMain(HINSTANCE hDLL, DWORD reason, LPVOID reserved)
 	switch (reason) {
 	case DLL_PROCESS_ATTACH:
 		DisableThreadLibraryCalls(hDLL);
+		dllinst = hDLL;
+		InitializeCriticalSection(&lyric.lock);
+		InitializeCriticalSection(&lyric_thread_lock);
+		break;
+	case DLL_PROCESS_DETACH:
+		if (ws_init_done) WSACleanup();
+		if (lyric_fetch_thread) CloseHandle(lyric_fetch_thread);
+		DeleteCriticalSection(&lyric_thread_lock);
+		DeleteCriticalSection(&lyric.lock);
 		break;
 	}
 	return TRUE;

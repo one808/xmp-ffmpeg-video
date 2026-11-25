@@ -4,6 +4,30 @@
 // file at the repository root.
 
 #include <winver.h>
+#include <winres.h>
+
+// vis config dialog (opened by the "FFmpeg video / lyrics" vis area's config
+// button; handled by LrcConfigDialogProc in xmp-ffmpeg.cpp). Control ids:
+//  201 service url, 202 download-online, 203 save-.lrc, 204 active-line colour,
+//  205 font name, 206 font size.
+1000 DIALOGEX 0, 0, 240, 108
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "FFmpeg lyrics"
+FONT 8, "MS Sans Serif", 0, 0, 0x0
+BEGIN
+    CONTROL         "Lyrics service:", IDC_STATIC, "Static", SS_LEFTNOWORDWRAP | WS_GROUP, 8, 8, 55, 8
+    EDITTEXT        201, 66, 7, 166, 12, ES_AUTOHSCROLL
+    CONTROL         "Download lyrics online when missing", 202, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 8, 24, 150, 10
+    CONTROL         "Save downloaded lyrics as .lrc next to track", 203, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 8, 37, 180, 10
+    CONTROL         "Active line colour (RRGGBB):", IDC_STATIC, "Static", SS_LEFTNOWORDWRAP | WS_GROUP, 8, 53, 85, 8
+    EDITTEXT        204, 96, 51, 40, 12, ES_UPPERCASE | ES_AUTOHSCROLL
+    CONTROL         "Font name:", IDC_STATIC, "Static", SS_LEFTNOWORDWRAP | WS_GROUP, 144, 53, 35, 8
+    EDITTEXT        205, 144, 61, 88, 12, ES_AUTOHSCROLL
+    CONTROL         "Font size:", IDC_STATIC, "Static", SS_LEFTNOWORDWRAP | WS_GROUP, 8, 69, 35, 8
+    EDITTEXT        206, 46, 67, 30, 12, ES_AUTOHSCROLL | ES_NUMBER
+    PUSHBUTTON      "OK", IDOK, 78, 88, 50, 14, BS_DEFPUSHBUTTON
+    PUSHBUTTON      "Cancel", IDCANCEL, 134, 88, 50, 14
+END
 
 VS_VERSION_INFO VERSIONINFO
  FILEVERSION @VERSIONNUM@

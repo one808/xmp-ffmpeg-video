@@ -40,7 +40,7 @@ echo "link libs: $FFLIBS"
 # libgcc_s_*.dll - everything goes into this single DLL.
 $TRIPLE-g++ -shared -o build/xmp-ffmpeg.dll build/xmp-ffmpeg.o build/xmp-ffmpeg-res.o \
 	-Wl,--kill-at -static-libstdc++ -static-libgcc $FFLIBS \
-	-lssp -latomic -lgdi32 -luser32
+	-lssp -latomic -lgdi32 -luser32 -lws2_32
 
 # sanity: the VERSIONINFO resource must be embedded (XMPlay reads it).
 # Binary UTF-16-aware check - `strings` misses short versions like "1.1"
