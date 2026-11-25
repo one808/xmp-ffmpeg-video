@@ -614,6 +614,8 @@ static void video_tick()
 	EnterCriticalSection(&video.lock);
 	if (!video.active || !video.vdec) { LeaveCriticalSection(&video.lock); return; }
 	int budget = 8; // max decode/feed iterations this tick
+	int nstarve = 0, ndrop = 0;
+	double shown_pts = -1;
 	while (budget-- > 0) {
 		if (!video.have_frame) {
 			int ret = avcodec_receive_frame(video.vdec, video.vframe);
@@ -641,6 +643,7 @@ static void video_tick()
 					avcodec_send_packet(video.vdec, NULL);
 					continue;
 				}
+				nstarve++;
 				break; // starved - wait for more packets
 			}
 			if (ret < 0) break; // drained or error
@@ -661,13 +664,33 @@ static void video_tick()
 		if (video.frame_pts > t + 0.06) break;   // in the future - wait
 		if (video.frame_pts < t - 0.30 && budget > 2) { // behind - drop
 			video.have_frame = FALSE;
+			ndrop++;
 			continue;
 		}
 		video_render_frame(); // scale into video.dib (under lock); sets have_new
+		shown_pts = video.frame_pts;
 		video.have_frame = FALSE;
 		break; // one present per tick is enough
 	}
+	int qnow = video.qcount;
 	LeaveCriticalSection(&video.lock);
+	// 1/sec diagnostic heartbeat: queue depth + per-second starvation/drop
+	// counts, used to diagnose the post-seek judder (%TEMP%\xmp-ffmpeg-video.log)
+	{
+		static int s_starved = 0, s_dropped = 0;
+		static double s_shown_pts = -1;
+		if (shown_pts > 0) s_shown_pts = shown_pts;
+		s_starved += nstarve;
+		s_dropped += ndrop;
+		DWORD nowt = GetTickCount();
+		static DWORD s_last = 0;
+		if (s_last && nowt - s_last >= 1000) {
+			s_last = nowt;
+			logmsg("vt: q=%d starved=%d dropped=%d last_shown=%.2f clock=%.2f",
+				qnow, s_starved, s_dropped, s_shown_pts, t);
+			s_starved = s_dropped = 0;
+		}
+	}
 }
 
 // -- window
@@ -1206,11 +1229,19 @@ static DWORD WINAPI FF_Process(float *buffer, DWORD count)
 	FFMPEG *f = current;
 	if (!f) return 0;
 	video_late_scan(f);
-	if (video.active) video_clock_capture(xmpfstatus->GetTime());
-	{ // liveness heartbeat, 1/sec
+	// sample-accurate playback clock: f->pos advances exactly as XMPlay
+	// consumes audio, so the video timeline tracks the audio that is ACTUALLY
+	// playing (xmpfstatus->GetTime() can be coarse/stale, which made the
+	// picture judder after seeks, worse on m3u8 where the audio re-buffers).
+	if (video.active) video_clock_capture(f->pos);
+	{ // demand + liveness heartbeat, 1/sec
 		static DWORD lastbeat;
 		DWORD now = GetTickCount();
-		if (now - lastbeat > 1000) { lastbeat = now; logmsg("cb: Process (alive)"); }
+		if (now - lastbeat > 1000) {
+			lastbeat = now;
+			logmsg("cb: Process count=%lu fpos=%.2f gettime=%.2f", (unsigned long)count,
+				f->pos, xmpfstatus ? xmpfstatus->GetTime() : -1.0);
+		}
 	}
 	EnterCriticalSection(&demux_lock);
 	DWORD done = 0;
