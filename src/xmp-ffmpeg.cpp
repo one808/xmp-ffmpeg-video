@@ -1224,6 +1224,94 @@ static char *read_embedded(FFMPEG *f)
 	return 0;
 }
 
+// ------------------------------------------------- direct ID3v2 tag reader
+// FFmpeg's custom-IO (XMPFILE) open path does not surface ID3v2 tags into
+// fmt->metadata for MP3, so when the demuxer leaves them empty we parse the
+// file's own TIT2/TPE1 frames directly. Handles ID3v2.3 and 2.4 (4-char
+// frames) and the four text encodings; values are returned as UTF-8.
+static void id3_text_to_utf8(const unsigned char *p, int n, unsigned char enc,
+                             char *out, int outn)
+{
+	if (outn <= 0) return;
+	out[0] = 0;
+	wchar_t w[512];
+	int wl = 0;
+	switch (enc) {
+	case 0: // 8-bit: ISO-8859-1 per spec, but CJK tools store CP_ACP bytes
+		wl = MultiByteToWideChar(CP_ACP, 0, (const char*)p, n, w, 511);
+		break;
+	case 3: // UTF-8
+		wl = MultiByteToWideChar(CP_UTF8, 0, (const char*)p, n, w, 511);
+		break;
+	case 1: // UTF-16, BOM decides endianness, native (LE) when no BOM
+	case 2: { // UTF-16BE
+		int i = 0, be = (enc == 2);
+		if (enc == 1) {
+			if (n >= 2 && p[0] == 0xFF && p[1] == 0xFE) { i = 2; be = 0; }
+			else if (n >= 2 && p[0] == 0xFE && p[1] == 0xFF) { i = 2; be = 1; }
+		}
+		int pairs = (n - i) / 2;
+		if (pairs > 511) pairs = 511;
+		for (int k = 0; k < pairs; k++)
+			w[k] = be ? (wchar_t)((p[i + 2 * k] << 8) | p[i + 2 * k + 1])
+			         : (wchar_t)((p[i + 2 * k + 1] << 8) | p[i + 2 * k]);
+		wl = pairs;
+		break;
+	}
+	}
+	if (wl < 0) wl = 0;
+	while (wl > 0 && w[wl - 1] == 0) wl--;
+	int need = WideCharToMultiByte(CP_UTF8, 0, w, wl, 0, 0, 0, 0);
+	if (need >= outn) need = outn - 1;
+	if (need < 1) { out[0] = 0; return; }
+	WideCharToMultiByte(CP_UTF8, 0, w, wl, out, need, 0, 0);
+	out[need] = 0;
+}
+static void read_id3v2(const char *filename, char *artist, int an, char *title, int tn)
+{
+	wchar_t *wp = utf8_path_to_wide(filename);
+	FILE *fp = wp ? _wfopen(wp, L"rb") : 0;
+	free(wp);
+	if (!fp) return;
+	unsigned char hdr[10];
+	if (fread(hdr, 1, 10, fp) != 10) { fclose(fp); return; }
+	if (hdr[0] != 'I' || hdr[1] != 'D' || hdr[2] != '3' || (hdr[3] != 3 && hdr[3] != 4)) {
+		fclose(fp); return; // only v2.3/v2.4 (4-char frames) are supported
+	}
+	int ver = hdr[3];
+	int taglen = ((int)hdr[6] << 21) | ((int)hdr[7] << 14) |
+	             ((int)hdr[8] << 7) | (int)hdr[9];
+	taglen += 10;                       // absolute offset just past the tag
+	int gt = 0, ga = 0;               // got title / got artist
+	unsigned char body[1024];
+	while (!gt || !ga) {
+		long here = ftell(fp);
+		if (here + 10 > taglen) break;
+		unsigned char fh[10];
+		if (fread(fh, 1, 10, fp) != 10) break;
+		if (fh[0] == 0) break;        // reached the padding block
+		char id[5];
+		id[0] = fh[0]; id[1] = fh[1]; id[2] = fh[2]; id[3] = fh[3]; id[4] = 0;
+		int is_title = id[0] == 'T' && id[1] == 'I' && id[2] == 'T' &&
+		               (id[3] == '2' || id[3] == '3');
+		int is_art = id[0] == 'T' && id[1] == 'P' && id[2] == 'E' && id[3] == '1';
+		int sz = (ver == 4) ?
+			(((int)fh[4] << 21) | ((int)fh[5] << 14) | ((int)fh[6] << 7) | (int)fh[7]) :
+			(((int)fh[4] << 24) | ((int)fh[5] << 16) | ((int)fh[6] << 8) | (int)fh[7]);
+		if (sz <= 0 || sz > 100000) break;          // malformed size: stop
+		int rl = sz < (int)sizeof body ? sz : (int)sizeof body;
+		int rd = rl ? (int)fread(body, 1, rl, fp) : 0;
+		if ((is_title || is_art) && rd >= 2) {
+			char txt[1024];
+			id3_text_to_utf8(body + 1, rd - 1, body[0], txt, sizeof txt);
+			if (is_title && !gt && txt[0]) { bcpy(title, tn, txt); gt = 1; }
+			if (is_art && !ga && txt[0]) { bcpy(artist, an, txt); ga = 1; }
+		}
+		if (sz - rd > 0 && fseek(fp, sz - rd, SEEK_CUR) != 0) break;
+	}
+	fclose(fp);
+}
+
 // ------------------------------------------------------------- fetch thread
 // tiny XML helpers: the search endpoint returns <lrc id="N" artist=".."
 // title=".." type=".."/> lines; we score candidates against the requested
@@ -1796,18 +1884,43 @@ static DWORD WINAPI FF_Open(const char *filename, XMPFILE file)
 			if (e && e->value) bcpy(title, sizeof title, e->value);
 		}
 		BOOL is_local = !current->netfile && !(filename && strstr(filename, "://"));
-		if (!title[0] && is_local && filename) {
-			// untagged local file: derive a search title from the file name
-			// ("Artist - Title.mp3" and "Title.mp3" both work with the service)
+		// source 2: when the demuxer left the tags empty, read the file's own
+		// ID3v2 TIT2/TPE1 frames directly (FFmpeg's custom-IO open does not
+		// surface ID3v2 metadata for MP3). Only fills what is still missing.
+		if (is_local && filename && (!artist[0] || !title[0])) {
+			char a2[512] = "", t2[512] = "";
+			read_id3v2(filename, a2, sizeof a2, t2, sizeof t2);
+			if (!artist[0] && a2[0]) bcpy(artist, sizeof artist, a2);
+			if (!title[0] && t2[0]) bcpy(title, sizeof title, t2);
+		}
+		// Backfill missing tags from the "Artist - Title" file name (XMPlay's
+		// default TitleForm). Fires when the tags left a title or an artist
+		// empty; a clean split beats the whole-stem title the service can't
+		// match (its search is title-containment, so "Artist - Title" returns
+		// nothing while "Title" + "Artist" does). Tags always win when set.
+		if (is_local && filename && (!title[0] || !artist[0])) {
+			char stem[512];
 			const char *base = filename;
 			for (const char *q = filename; *q; q++)
 				if (*q == '\\' || *q == '/') base = q + 1;
-			char tbuf[512];
-			bcpy(tbuf, sizeof tbuf, base);
-			char *dot = tbuf + strlen(tbuf);
-			while (dot > tbuf && *dot != '.') dot--;
-			if (dot > tbuf) *dot = 0;
-			bcpy(title, sizeof title, tbuf);
+			bcpy(stem, sizeof stem, base);
+			char *dot = stem + strlen(stem);
+			while (dot > stem && *dot != '.') dot--;
+			if (dot > stem) *dot = 0;            // drop the extension
+			const char *sep = strstr(stem, " - ");
+			if (!sep) sep = strstr(stem, " _ ");
+			char a[512] = "", t2[512];
+			if (sep) {
+				size_t al = (size_t)(sep - stem);
+				memcpy(a, stem, al); a[al] = 0;  // left  = artist
+				bcpy(t2, sizeof t2, sep + 3);    // right = title
+			} else {
+				bcpy(t2, sizeof t2, stem);        // no separator: whole stem
+			}
+			while (*a == ' ' || *a == '\t') a++;
+			while (*t2 == ' ' || *t2 == '\t') t2++;
+			if (!artist[0] && a[0]) bcpy(artist, sizeof artist, a);
+			if (!title[0]) bcpy(title, sizeof title, t2[0] ? t2 : stem);
 		}
 		lyric_start(current, filename, artist, title, is_local);
 	}
