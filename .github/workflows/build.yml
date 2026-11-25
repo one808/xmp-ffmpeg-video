@@ -83,7 +83,7 @@ jobs:
           retention-days: 30
 
       - name: Publish GitHub Release (add-only, never touches old releases)
-        if: success() && github.ref == 'refs/heads/main'
+        if: success() && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/lrc-lyrics')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
