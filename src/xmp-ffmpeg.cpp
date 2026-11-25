@@ -877,6 +877,7 @@ static int lrc_parse(const char *text, LrcLine **out)
 						*o++ = *p++;
 					}
 					*o = 0;
+					o = w; // the copy loop advanced o to the end; reset to the start
 					while (*o == ' ' || *o == '\t') o++;        // ltrim
 					char *b = o + strlen(o);
 					while (b > o && (b[-1] == ' ' || b[-1] == '\t')) b--; // rtrim
@@ -1024,10 +1025,10 @@ static char *http_get(const char *url)
 	}
 	closesocket(s);
 	if (!body) return 0;
-	char *hdr = body;
+	// strip the HTTP header block so the caller gets just the body
 	char *hs = strstr(body, "\r\n\r\n");
 	char *bstart = hs ? hs + 4 : body;
-	if (ci_contains(hdr, "Transfer-Encoding") && ci_contains(hdr, "chunked")) {
+	if (ci_contains(body, "Transfer-Encoding") && ci_contains(body, "chunked")) {
 		char *src = bstart, *dst = body;
 		while (*src) {
 			char *eol = strstr(src, "\r\n");
@@ -1046,6 +1047,10 @@ static char *http_get(const char *url)
 			if (src[0] == '\r' && src[1] == '\n') src += 2;
 		}
 		*dst = 0;
+	} else {
+		// Content-Length response: move the body to the front, drop the headers
+		size_t blen = strlen(bstart);
+		memmove(body, bstart, blen + 1);
 	}
 	return body;
 }
@@ -1305,7 +1310,18 @@ static DWORD WINAPI lyric_fetch_thread(LPVOID arg)
 					snprintf(dlurl, sizeof dlurl, "%s/?dl?Id=%d&Code=1", c->service, best);
 					logmsg("lrc: download id=%d (score=%.0f)", best, best_score);
 					char *body = http_get(dlurl);
-					if (body && looks_like_lrc(body)) lrc_text = body;
+					if (body && looks_like_lrc(body)) {
+						lrc_text = body;
+						{ // diagnostic: length + escaped head so field issues are visible
+							char head[97];
+							unsigned char *b = (unsigned char*)body;
+							int hl = (int)strlen(body);
+							if (hl > 48) hl = 48;
+							for (int i = 0; i < hl; i++) head[i * 2] = (b[i] >= 32 && b[i] < 127) ? b[i] : '.';
+							head[hl * 2] = 0;
+							logmsg("lrc: got %lu bytes, head=\"%s\"", (unsigned long)strlen(body), head);
+						}
+					}
 					else { logmsg("lrc: download failed or not LRC (id=%d)", best); free(body); }
 				} else {
 					logmsg("lrc: no <lrc> candidate in search result");
