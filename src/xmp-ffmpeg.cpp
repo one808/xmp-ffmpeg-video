@@ -131,6 +131,7 @@ struct VIDEO {
 	AVRational frame_sar;         // per-frame override when present
 	DWORD last_present;           // GetTickCount of the last frame presented (0 = none yet)
 	BOOL have_new;                // a decoded frame is waiting for FF_VisRenderDC
+	BOOL vis_blank;               // vis area currently black (cleared on stop)
 };
 static VIDEO video;
 
@@ -899,6 +900,7 @@ static void video_attach(FFMPEG *f)
 	}
 	video.sar = av_guess_sample_aspect_ratio(f->fmt, f->fmt->streams[f->vstream], NULL);
 	video.have_new = FALSE;
+	video.vis_blank = FALSE;
 	video.active = TRUE;
 	LeaveCriticalSection(&video.lock);
 	video_window_init(); // make sure the decoder thread is alive
@@ -915,6 +917,7 @@ static void video_detach()
 	video.have_frame = FALSE;
 	video.vdec = 0; video.fmt = 0;
 	video.have_new = FALSE;
+	video.vis_blank = FALSE;
 	LeaveCriticalSection(&video.lock);
 }
 
@@ -927,6 +930,9 @@ static BOOL WINAPI FF_VisOpen(DWORD colors[3])
 {
 	logmsg("vis: open");
 	video_window_init(); // ensure the decoder thread is alive
+	EnterCriticalSection(&video.lock);
+	video.vis_blank = FALSE; // new track/vis session: refresh resumes
+	LeaveCriticalSection(&video.lock);
 	return TRUE;
 }
 
@@ -953,10 +959,24 @@ static BOOL WINAPI FF_VisRenderDC(HDC dc, SIZE size, DWORD flags)
 	// says "not playing" -> show black so the last frame doesn't linger in the
 	// vis area. (XMPlay itself only clears the vis AREA / main-window clock on
 	// a full close - that part is not something the plugin controls.)
+	// Per Ian (un4seen #21049): return true the first time we clear, then
+	// false afterwards so XMPlay stops refreshing a static display.
 	if (xmpfstatus && !xmpfstatus->IsPlaying()) {
-		FillRect(dc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
-		return TRUE;
+		EnterCriticalSection(&video.lock);
+		BOOL need_blank = !video.vis_blank;
+		if (need_blank) video.vis_blank = TRUE;
+		LeaveCriticalSection(&video.lock);
+		if (need_blank) {
+			FillRect(dc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
+			return TRUE;
+		}
+		return FALSE;
 	}
+
+	// playing: the display is live again, so the blank latch is stale
+	EnterCriticalSection(&video.lock);
+	video.vis_blank = FALSE;
+	LeaveCriticalSection(&video.lock);
 
 	// no video stream on this track (audio-only) -> keep it blank
 	if (!video.dib || video.dibw < 1 || !video.vdec) {
