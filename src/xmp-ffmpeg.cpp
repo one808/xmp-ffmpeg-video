@@ -684,7 +684,8 @@ static void video_tick()
 		s_dropped += ndrop;
 		DWORD nowt = GetTickCount();
 		static DWORD s_last = 0;
-		if (s_last && nowt - s_last >= 1000) {
+		if (!s_last) s_last = nowt;
+		if (nowt - s_last >= 1000) {
 			s_last = nowt;
 			logmsg("vt: q=%d starved=%d dropped=%d last_shown=%.2f clock=%.2f",
 				qnow, s_starved, s_dropped, s_shown_pts, t);
@@ -1229,17 +1230,18 @@ static DWORD WINAPI FF_Process(float *buffer, DWORD count)
 	FFMPEG *f = current;
 	if (!f) return 0;
 	video_late_scan(f);
-	// sample-accurate playback clock: f->pos advances exactly as XMPlay
-	// consumes audio, so the video timeline tracks the audio that is ACTUALLY
-	// playing (xmpfstatus->GetTime() can be coarse/stale, which made the
-	// picture judder after seeks, worse on m3u8 where the audio re-buffers).
-	if (video.active) video_clock_capture(f->pos);
-	{ // demand + liveness heartbeat, 1/sec
+	// video clock: XMPlay's nominal track time. It tracks the audible audio
+	// head; f->pos (what we've handed the device so far) leads it by the
+	// audio device buffer (~0.4s here, and it wobbles 0.1->0.4 right after
+	// a seek when the buffer drains and refills) - driving the picture off
+	// f->pos makes the video rush ahead of the audio and stutter.
+	if (video.active) video_clock_capture(xmpfstatus ? xmpfstatus->GetTime() : f->pos);
+	{ // demand + clock heartbeat, 10/sec
 		static DWORD lastbeat;
 		DWORD now = GetTickCount();
-		if (now - lastbeat > 1000) {
+		if (now - lastbeat >= 100) {
 			lastbeat = now;
-			logmsg("cb: Process count=%lu fpos=%.2f gettime=%.2f", (unsigned long)count,
+			logmsg("cb: count=%lu fpos=%.2f gettime=%.2f", (unsigned long)count,
 				f->pos, xmpfstatus ? xmpfstatus->GetTime() : -1.0);
 		}
 	}
