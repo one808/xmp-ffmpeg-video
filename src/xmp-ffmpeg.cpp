@@ -894,7 +894,11 @@ static DWORD WINAPI video_thread(LPVOID)
 	// video.dib; XMPlay's vis area shows it via FF_VisRenderDC.
 	while (1) {
 		video_tick();
-		Sleep(15); // ~66fps cadence, plenty for SD content
+		// during a seek catch-up run at ~1kHz instead of 66Hz: the queued
+		// stale frames (keyframe -> target) are then dropped at decoder
+		// speed, so a local seek shows the target in ~0.1-0.3s instead of
+		// churning through them at the 15ms cadence (~2s).
+		Sleep(video.seeking ? 1 : 15);
 	}
 	return 0;
 }
@@ -966,6 +970,7 @@ static void video_detach()
 	video.vdec = 0; video.fmt = 0;
 	video.have_new = FALSE;
 	video.vis_blank = FALSE;
+	video.seeking = FALSE; // stop the fast catch-up cadence
 	LeaveCriticalSection(&video.lock);
 }
 
