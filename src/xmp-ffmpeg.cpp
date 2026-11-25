@@ -23,7 +23,6 @@
 #include <ctype.h>
 
 #include <winsock2.h>
-#include <netdb.h>
 #include <windows.h>
 #include <wchar.h>
 #include "xmpin.h"
