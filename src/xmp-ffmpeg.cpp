@@ -737,13 +737,14 @@ struct LRC_CFG {
 	DWORD cur_color;    // 0xRRGGBB, colour of the active line
 	char font_name[64];
 	int  font_size;     // pixel height
+	int  offset_tenths; // user time offset, tenths of a second (+ = lyrics lag)
 };
 static LRC_CFG lrc_cfg;
 static void bcpy(char *dst, size_t dstn, const char *src); // forward (defn below)
 
 static void lrc_cfg_defaults()
 {
-	static const LRC_CFG d = { "http://lrc.8od.top:88", 1, 1, 0x00ff88, "SimSun", 18 };
+	static const LRC_CFG d = { "http://lrc.8od.top:88", 1, 1, 0x00ff88, "SimSun", 18, 0 };
 	lrc_cfg = d;
 }
 static void lrc_cfg_load()
@@ -757,6 +758,7 @@ static void lrc_cfg_load()
 	if (xmpfreg->GetInt(LRC_REGSEC, "CurColor", &v))    lrc_cfg.cur_color    = (DWORD)v;
 	{ char buf[64]; if (xmpfreg->GetString(LRC_REGSEC, "FontName", buf, sizeof buf)) bcpy(lrc_cfg.font_name, sizeof lrc_cfg.font_name, buf); }
 	if (xmpfreg->GetInt(LRC_REGSEC, "FontSize", &v) && v >= 8 && v <= 72) lrc_cfg.font_size = v;
+	if (xmpfreg->GetInt(LRC_REGSEC, "OffsetTenths", &v) && v >= -600 && v <= 600) lrc_cfg.offset_tenths = v;
 }
 static void lrc_cfg_save()
 {
@@ -767,6 +769,7 @@ static void lrc_cfg_save()
 	{ int v = (int)lrc_cfg.cur_color;         xmpfreg->SetInt(LRC_REGSEC, "CurColor", &v); }
 	xmpfreg->SetString(LRC_REGSEC, "FontName", lrc_cfg.font_name);
 	xmpfreg->SetInt(LRC_REGSEC, "FontSize", &lrc_cfg.font_size);
+	{ int v = lrc_cfg.offset_tenths; xmpfreg->SetInt(LRC_REGSEC, "OffsetTenths", &v); }
 }
 
 // -------------------------------------------------------------- lyrics store
@@ -1181,15 +1184,16 @@ static char *read_sidecar(const char *filename_utf8)
 	if (!utf8 || !looks_like_lrc(utf8)) { free(utf8); return 0; }
 	return utf8;
 }
-static void save_sidecar(const char *filename_utf8, const char *lrc_text)
+static BOOL save_sidecar(const char *filename_utf8, const char *lrc_text)
 {
 	wchar_t *wp = sidecar_wide_path(filename_utf8);
-	if (!wp) return;
+	if (!wp) return FALSE;
 	FILE *f = _wfopen(wp, L"wb");
 	free(wp);
-	if (!f) return;
-	fwrite(lrc_text, 1, strlen(lrc_text), f);
+	if (!f) return FALSE;
+	size_t wr = fwrite(lrc_text, 1, strlen(lrc_text), f);
 	fclose(f);
+	return wr == strlen(lrc_text);
 }
 static char *read_embedded(FFMPEG *f)
 {
@@ -1342,8 +1346,12 @@ static DWORD WINAPI lyric_fetch_thread(LPVOID arg)
 		lyric.nlines = 0;
 		lyric.nlines = lrc_parse(lrc_text, &lyric.lines);
 		lyric.state = lyric.nlines > 0 ? 2 : 0;
-		if (lyric.nlines > 0 && c->save_sidecar && !strstr(c->filename, "://"))
-			save_sidecar(c->filename, lrc_text);
+		if (lyric.nlines > 0 && c->save_sidecar && !strstr(c->filename, "://")) {
+			if (save_sidecar(c->filename, lrc_text))
+				logmsg("lrc: sidecar saved next to %s", c->filename);
+			else
+				logmsg("lrc: sidecar save FAILED for %s", c->filename);
+		}
 		logmsg("lrc: ready lines=%d state=%d", lyric.nlines, lyric.state);
 	} else {
 		logmsg("lrc: fetch stale, dropped");
@@ -1443,20 +1451,26 @@ static int lrc_font_cache_size = -1;
 static int lyric_render(HDC dc, int W, int H)
 {
 	// returns 1 if lyrics were drawn, 0 otherwise (caller falls back to black)
-	double t = video_clock_now();
+	// effective time = playback clock - user offset (+offset = lyrics lag)
+	double t = video_clock_now() - (double)lrc_cfg.offset_tenths * 0.1;
+	int lh = lrc_cfg.font_size + 6; // line height in px
+	int rows = H / lh;
+	if (rows < 3) rows = 3;
+	if (rows > 12) rows = 12;
+	int mid = rows / 2; // snapshot slot the current line lands in
 	const char *texts[32];
-	int n = 0;
-	int cur = -1;
+	int n = 0, cur = -1, i0 = 0;
 	{
 		EnterCriticalSection(&lyric.lock);
 		if (lyric.state == 2 && lyric.nlines > 0) {
-			for (int i = 0; i < lyric.nlines && i < 32; i++) {
+			// current line = the last line whose time has passed. Full linear
+			// scan: the list is small (at most a few hundred) and a capped
+			// scan here froze the display at line 32.
+			for (int i = 0; i < lyric.nlines; i++)
 				if (t >= lyric.lines[i].t) cur = i;
-				else break;
-			}
 			if (cur < 0) cur = 0;
-			int i0 = cur - 1;
-			if (i0 < 0) i0 = 0;
+			i0 = cur - mid; // place the current line mid-panel; older lines
+			if (i0 < 0) i0 = 0; // scroll up out of the top, newer from below
 			for (int i = i0; i < lyric.nlines && n < 32; i++) {
 				texts[n] = lyric.lines[i].text;
 				n++;
@@ -1464,7 +1478,7 @@ static int lyric_render(HDC dc, int W, int H)
 		}
 		LeaveCriticalSection(&lyric.lock);
 	}
-	if (cur < 0 || n == 0) return 0;
+	if (n == 0) return 0;
 
 	// rebuild the font if the config changed
 	{
@@ -1489,11 +1503,7 @@ static int lyric_render(HDC dc, int W, int H)
 		}
 	}
 
-	int lh = lrc_cfg.font_size + 6; // line height in px
-	int rows = H / lh;
-	if (rows < 3) rows = 3;
-	if (rows > 12) rows = 12;
-	int currow = rows / 2;          // current line sits mid-panel, lines scroll up
+	int currow = cur - i0; // snapshot slot of the current line (0..mid)
 	int bg = (int)vis_colors[0];
 	int txt = (int)vis_colors[1];
 	int R = (bg >> 16) & 0xff, G = (bg >> 8) & 0xff, B = bg & 0xff;
@@ -1503,10 +1513,9 @@ static int lyric_render(HDC dc, int W, int H)
 	HPEN oldpen = (HPEN)SelectObject(dc, GetStockObject(NULL_PEN));
 	HGDIOBJ oldbr = SelectObject(dc, GetStockObject(NULL_BRUSH));
 	for (int r = 0; r < rows; r++) {
-		int li = cur - currow + r;
-		if (li < 0 || li >= n) continue;
+		if (r >= n) continue; // texts[r] = lines[i0 + r]
 		wchar_t wtext[512];
-		MultiByteToWideChar(CP_UTF8, 0, texts[li], -1, wtext, 512);
+		MultiByteToWideChar(CP_UTF8, 0, texts[r], -1, wtext, 512);
 		RECT rc = { 0, r * lh, W, r * lh + lh };
 		COLORREF cr = (r == currow) ? (COLORREF)lrc_cfg.cur_color : RGB(dr, dg, db);
 		SetTextColor(dc, cr);
@@ -1539,6 +1548,7 @@ BOOL CALLBACK LrcConfigDialogProc(HWND h, UINT m, WPARAM w, LPARAM l)
 		{ char b[32]; sprintf(b, "%06X", (unsigned)lrc_cfg.cur_color); SetDlgItemText(h, 204, b); }
 		SetDlgItemText(h, 205, lrc_cfg.font_name);
 		{ char b[16]; sprintf(b, "%d", lrc_cfg.font_size); SetDlgItemText(h, 206, b); }
+		{ char b[16]; sprintf(b, "%d", lrc_cfg.offset_tenths); SetDlgItemText(h, 207, b); }
 		return 1;
 	case WM_COMMAND:
 		switch (LOWORD(w)) {
@@ -1554,6 +1564,7 @@ BOOL CALLBACK LrcConfigDialogProc(HWND h, UINT m, WPARAM w, LPARAM l)
 			GetDlgItemText(h, 205, buf, sizeof buf);
 			bcpy(lrc_cfg.font_name, sizeof lrc_cfg.font_name, buf);
 			{ int sz = GetDlgItemInt(h, 206, NULL, TRUE); if (sz >= 8 && sz <= 72) lrc_cfg.font_size = sz; }
+			{ int of = GetDlgItemInt(h, 207, NULL, TRUE); if (of >= -600 && of <= 600) lrc_cfg.offset_tenths = of; }
 			lrc_cfg_save();
 			EndDialog(h, 1);
 			break;

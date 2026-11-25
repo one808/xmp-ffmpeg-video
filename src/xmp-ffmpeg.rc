@@ -10,7 +10,7 @@
 // button; handled by LrcConfigDialogProc in xmp-ffmpeg.cpp). Control ids:
 //  201 service url, 202 download-online, 203 save-.lrc, 204 active-line colour,
 //  205 font name, 206 font size.
-1000 DIALOGEX 0, 0, 240, 108
+1000 DIALOGEX 0, 0, 240, 124
 STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "FFmpeg lyrics"
 FONT 8, "MS Sans Serif", 0, 0, 0x0
@@ -25,8 +25,10 @@ BEGIN
     EDITTEXT        205, 144, 61, 88, 12, ES_AUTOHSCROLL
     CONTROL         "Font size:", IDC_STATIC, "Static", SS_LEFTNOWORDWRAP | WS_GROUP, 8, 69, 35, 8
     EDITTEXT        206, 46, 67, 30, 12, ES_AUTOHSCROLL | ES_NUMBER
-    PUSHBUTTON      "OK", IDOK, 78, 88, 50, 14, BS_DEFPUSHBUTTON
-    PUSHBUTTON      "Cancel", IDCANCEL, 134, 88, 50, 14
+    CONTROL         "Time offset (0.1s):", IDC_STATIC, "Static", SS_LEFTNOWORDWRAP | WS_GROUP, 8, 84, 60, 8
+    EDITTEXT        207, 72, 82, 30, 12, ES_AUTOHSCROLL | ES_NUMBER
+    PUSHBUTTON      "OK", IDOK, 78, 103, 50, 14, BS_DEFPUSHBUTTON
+    PUSHBUTTON      "Cancel", IDCANCEL, 134, 103, 50, 14
 END
 
 VS_VERSION_INFO VERSIONINFO
