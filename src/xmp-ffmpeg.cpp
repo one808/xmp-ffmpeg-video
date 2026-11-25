@@ -1030,7 +1030,7 @@ static char *http_get(const char *url)
 	if (ci_contains(hdr, "Transfer-Encoding") && ci_contains(hdr, "chunked")) {
 		char *src = bstart, *dst = body;
 		while (*src) {
-			const char *eol = strstr(src, "\r\n");
+			char *eol = strstr(src, "\r\n");
 			if (!eol) break;
 			int szd = (int)(eol - src);
 			if (szd > 23) szd = 23;
