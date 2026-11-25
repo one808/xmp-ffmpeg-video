@@ -1547,82 +1547,116 @@ static void lyric_invalidate()
 }
 
 // --------------------------------------------------------------- vis renderer
-static HFONT lrc_font;
-static char lrc_font_cache[64];
-static int lrc_font_cache_size = -1;
+// graduated font cache: HFONTs keyed by point size, rebuilt only when the
+// font name changes. The dynamic-size lyric animation picks the nearest size
+// per line instead of recreating GDI fonts every frame.
+static HFONT lrc_fonts[96];
+static char lrc_font_sig[64];
+static int lrc_font_sig_size = -1;
+
+static HFONT lrc_font_pt(int pt)
+{
+	if (pt < 4) pt = 4;
+	if (pt > 95) pt = 95;
+	int len = (int)strlen(lrc_cfg.font_name);
+	int same = (lrc_font_sig_size == len);
+	if (same) {
+		int cmp = len < (int)sizeof lrc_font_sig ? len : (int)sizeof lrc_font_sig - 1;
+		for (int i = 0; i < cmp; i++) if (lrc_font_sig[i] != lrc_cfg.font_name[i]) { same = 0; break; }
+	}
+	if (!same) {
+		for (int i = 0; i < 96; i++) if (lrc_fonts[i]) { DeleteObject(lrc_fonts[i]); lrc_fonts[i] = 0; }
+		bcpy(lrc_font_sig, sizeof lrc_font_sig, lrc_cfg.font_name);
+		lrc_font_sig_size = len;
+	}
+	if (!lrc_fonts[pt]) {
+		wchar_t fn[64];
+		MultiByteToWideChar(CP_UTF8, 0, lrc_cfg.font_name, -1, fn, 64);
+		lrc_fonts[pt] = CreateFontW(-pt, 0, 0, 0, FW_NORMAL, FALSE, FALSE, 0,
+			DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
+			DEFAULT_PITCH | FF_DONTCARE, fn);
+		if (!lrc_fonts[pt])
+			lrc_fonts[pt] = CreateFontW(-pt, 0, 0, 0, FW_NORMAL, 0, 0, 0,
+				DEFAULT_CHARSET, 0, 0, DEFAULT_QUALITY, DEFAULT_PITCH, L"Tahoma");
+	}
+	return lrc_fonts[pt];
+}
 
 static int lyric_render(HDC dc, int W, int H)
 {
 	// returns 1 if lyrics were drawn, 0 otherwise (caller falls back to black)
-	// effective time = playback clock - user offset (+offset = lyrics lag)
+	// effective time = playback clock - user offset
 	double t = video_clock_now() - (double)lrc_cfg.offset_tenths * 0.1;
-	int lh = lrc_cfg.font_size + 6; // line height in px
-	int rows = H / lh;
-	if (rows < 3) rows = 3;
-	if (rows > 12) rows = 12;
-	int mid = rows / 2; // snapshot slot the current line lands in
-	const char *texts[32];
-	int n = 0, cur = -1, i0 = 0;
+	int lh = lrc_cfg.font_size + 6;      // px the scroll travels per line
+	int cy = H / 2;                      // focal line anchored mid-panel
+
+	double fp = 0;                       // focal position in line-space
+	const char *texts[48];
+	int idxs[48];
+	int n = 0;
 	{
 		EnterCriticalSection(&lyric.lock);
 		if (lyric.state == 2 && lyric.nlines > 0) {
-			// current line = the last line whose time has passed. Full linear
-			// scan: the list is small (at most a few hundred) and a capped
-			// scan here froze the display at line 32.
+			int cur = -1;
 			for (int i = 0; i < lyric.nlines; i++)
 				if (t >= lyric.lines[i].t) cur = i;
 			if (cur < 0) cur = 0;
-			i0 = cur - mid; // place the current line mid-panel; older lines
-			if (i0 < 0) i0 = 0; // scroll up out of the top, newer from below
-			for (int i = i0; i < lyric.nlines && n < 32; i++) {
+			double f = 0;
+			if (cur + 1 < lyric.nlines) {  // progress 0->1 toward the next line
+				double t0 = lyric.lines[cur].t, t1 = lyric.lines[cur + 1].t;
+				double span = t1 - t0;
+				f = (span > 0.0) ? (t - t0) / span : 1.0;
+				if (f < 0) f = 0;
+				if (f > 1) f = 1;
+			}
+			fp = (double)cur + f;          // last line rests centered (f stays 0)
+			int spanLines = (H / lh) + 2;
+			int a = (int)fp - spanLines;
+			int b = (int)fp + spanLines;
+			for (int i = 0; i < lyric.nlines; i++) {
+				if (i < a || i > b) continue;
 				texts[n] = lyric.lines[i].text;
-				n++;
+				idxs[n] = i;
+				if (++n >= 48) break;
 			}
 		}
 		LeaveCriticalSection(&lyric.lock);
 	}
 	if (n == 0) return 0;
 
-	// rebuild the font if the config changed
-	{
-		BOOL changed = (lrc_font_cache_size != lrc_cfg.font_size);
-		if (!changed) {
-			int len = (int)strlen(lrc_cfg.font_name);
-			if (len >= (int)sizeof lrc_font_cache) changed = 1;
-			else if (len != (int)strlen(lrc_font_cache)) changed = 1;
-			else for (int i = 0; i < len; i++) if (lrc_font_cache[i] != lrc_cfg.font_name[i]) { changed = 1; break; }
-		}
-		if (changed) {
-			bcpy(lrc_font_cache, sizeof lrc_font_cache, lrc_cfg.font_name);
-			lrc_font_cache_size = lrc_cfg.font_size;
-			if (lrc_font) DeleteObject(lrc_font);
-			wchar_t fn[64];
-			MultiByteToWideChar(CP_UTF8, 0, lrc_cfg.font_name, -1, fn, 64);
-			lrc_font = CreateFontW(-(lrc_cfg.font_size), 0, 0, 0, FW_NORMAL, FALSE, FALSE, 0,
-				DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
-				DEFAULT_PITCH | FF_DONTCARE, fn);
-			if (!lrc_font) lrc_font = CreateFontW(-lrc_cfg.font_size, 0, 0, 0, FW_NORMAL, 0, 0, 0,
-				DEFAULT_CHARSET, 0, 0, DEFAULT_QUALITY, DEFAULT_PITCH, L"Tahoma");
-		}
-	}
-
-	int currow = cur - i0; // snapshot slot of the current line (0..mid)
 	int bg = (int)vis_colors[0];
 	int txt = (int)vis_colors[1];
 	int R = (bg >> 16) & 0xff, G = (bg >> 8) & 0xff, B = bg & 0xff;
 	int tr = (txt >> 16) & 0xff, tg = (txt >> 8) & 0xff, tb = txt & 0xff;
-	int dr = R + (tr - R) / 2, dg = G + (tg - G) / 2, db = B + (tb - B) / 2; // dimmed
-	HFONT oldf = (HFONT)SelectObject(dc, lrc_font);
+	int dr = R + (tr - R) / 2, dg = G + (tg - G) / 2, db = B + (tb - B) / 2; // dim base
+	int ar = (int)((lrc_cfg.cur_color >> 16) & 0xff);
+	int ag = (int)((lrc_cfg.cur_color >> 8) & 0xff);
+	int ab = (int)(lrc_cfg.cur_color & 0xff);
+
+	HFONT oldf = (HFONT)SelectObject(dc, lrc_font_pt(lrc_cfg.font_size));
 	HPEN oldpen = (HPEN)SelectObject(dc, GetStockObject(NULL_PEN));
 	HGDIOBJ oldbr = SelectObject(dc, GetStockObject(NULL_BRUSH));
-	for (int r = 0; r < rows; r++) {
-		if (r >= n) continue; // texts[r] = lines[i0 + r]
+	SetBkMode(dc, TRANSPARENT);
+	for (int k = 0; k < n; k++) {
+		double dist = (double)idxs[k] - fp;         // 0 at focal, + below, - above
+		double ad = (dist < 0) ? -dist : dist;
+		double scale = 1.0 - 0.20 * ad;             // focal biggest, shrinking away
+		if (scale < 0.55) scale = 0.55;
+		if (scale > 1.0) scale = 1.0;
+		int pt = (int)(lrc_cfg.font_size * scale + 0.5);
+		double emph = 1.0 - ad / 3.0;               // accent fades with distance
+		if (emph < 0) emph = 0;
+		if (emph > 1) emph = 1;
+		int m = (int)(emph * 100 + 0.5);
+		int cr = dr + (ar - dr) * m / 100;
+		int cg = dg + (ag - dg) * m / 100;
+		int cb = db + (ab - db) * m / 100;
+		int y = cy + (int)(dist * lh + 0.5);         // smooth sub-line scroll
 		wchar_t wtext[512];
-		MultiByteToWideChar(CP_UTF8, 0, texts[r], -1, wtext, 512);
-		RECT rc = { 0, r * lh, W, r * lh + lh };
-		COLORREF cr = (r == currow) ? (COLORREF)lrc_cfg.cur_color : RGB(dr, dg, db);
-		SetTextColor(dc, cr);
-		SetBkMode(dc, TRANSPARENT);
+		MultiByteToWideChar(CP_UTF8, 0, texts[k], -1, wtext, 512);
+		RECT rc = { 0, y - lh / 2, W, y + lh / 2 };
+		SelectObject(dc, lrc_font_pt(pt));
+		SetTextColor(dc, RGB(cr, cg, cb));
 		DrawTextW(dc, wtext, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 	}
 	SelectObject(dc, oldf);
