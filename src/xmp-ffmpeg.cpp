@@ -906,6 +906,21 @@ static int lrc_parse(const char *text, LrcLine **out)
 		if (!nl) break;
 		s = nl + 1;
 	}
+	// a multi-verse (e.g. 酷我-compressed) LRC lists lines out of order and
+	// splits one source line into several entries. The renderer assumes the
+	// array is ascending in time (current line = last whose time passed, and
+	// the scroll window reads consecutive entries), so sort here. Stable
+	// insertion sort keeps equal-time entries in source order. The array is
+	// small (a few hundred at most) so O(n^2) is fine.
+	for (int i = 1; i < n; i++) {
+		LrcLine key = lines[i];
+		int j = i - 1;
+		while (j >= 0 && lines[j].t > key.t) {
+			lines[j + 1] = lines[j];
+			j--;
+		}
+		lines[j + 1] = key;
+	}
 	*out = lines;
 	return n;
 }
