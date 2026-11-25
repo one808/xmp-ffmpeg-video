@@ -1269,6 +1269,7 @@ static DWORD WINAPI lyric_fetch_thread(LPVOID arg)
 			snprintf(url, sizeof url, "%s/?sh?Artist=%s&Title=%s", c->service, ah, th);
 			logmsg("lrc: search %s", url);
 			char *xml = http_get(url);
+			if (!xml) logmsg("lrc: search http failed (url=%s)", url);
 			if (xml) {
 				// score every <lrc> candidate against the requested title/artist
 				int best = -1;
@@ -1305,13 +1306,17 @@ static DWORD WINAPI lyric_fetch_thread(LPVOID arg)
 					logmsg("lrc: download id=%d (score=%.0f)", best, best_score);
 					char *body = http_get(dlurl);
 					if (body && looks_like_lrc(body)) lrc_text = body;
-					else free(body);
+					else { logmsg("lrc: download failed or not LRC (id=%d)", best); free(body); }
+				} else {
+					logmsg("lrc: no <lrc> candidate in search result");
 				}
 				free(xml);
 			}
 			free(ah);
 			free(th);
 		}
+	} else {
+		logmsg("lrc: service skipped: no artist/title");
 	}
 	EnterCriticalSection(&lyric.lock);
 	BOOL fresh = (lyric.gen == gen);
@@ -1348,20 +1353,29 @@ static void lyric_start(FFMPEG *f, const char *filename, const char *artist, con
 	LeaveCriticalSection(&lyric.lock);
 
 	char *text = 0;
-	if (is_local) text = read_sidecar(filename);
-	if (!text) text = read_embedded(f);
+	const char *src = 0;
+	if (is_local) { text = read_sidecar(filename); src = "sidecar"; }
+	if (!text) { text = read_embedded(f); src = "embedded"; }
 	if (text) {
+		BOOL ok = FALSE;
 		EnterCriticalSection(&lyric.lock);
 		if (lyric.gen == gen) {
 			lyric.nlines = lrc_parse(text, &lyric.lines);
 			lyric.state = lyric.nlines > 0 ? 2 : 0;
-			logmsg("lrc: local lines=%d", lyric.nlines);
+			ok = lyric.nlines > 0;
+			logmsg("lrc: %s lyrics lines=%d", src, lyric.nlines);
 		}
 		LeaveCriticalSection(&lyric.lock);
 		free(text);
+		if (ok) return;
+		// unparsable local lyrics: fall through to the service
+	}
+	if (!lrc_cfg.use_service || !lrc_cfg.service[0]) {
+		logmsg("lrc: no local lyrics and service off -> none");
 		return;
 	}
-	if (!lrc_cfg.use_service || !lrc_cfg.service[0]) return;
+	logmsg("lrc: no local lyrics, fetching from %s (artist=\"%s\" title=\"%s\")",
+		lrc_cfg.service, artist ? artist : "", title ? title : "");
 	// spawn the network fetch (only one in flight; a stale one drops its result)
 	EnterCriticalSection(&lyric_thread_lock);
 	LyricFetchCtx *c = (LyricFetchCtx*)calloc(1, sizeof(LyricFetchCtx));
@@ -1740,6 +1754,19 @@ static DWORD WINAPI FF_Open(const char *filename, XMPFILE file)
 			if (e && e->value) bcpy(title, sizeof title, e->value);
 		}
 		BOOL is_local = !current->netfile && !(filename && strstr(filename, "://"));
+		if (!title[0] && is_local && filename) {
+			// untagged local file: derive a search title from the file name
+			// ("Artist - Title.mp3" and "Title.mp3" both work with the service)
+			const char *base = filename;
+			for (const char *q = filename; *q; q++)
+				if (*q == '\\' || *q == '/') base = q + 1;
+			char tbuf[512];
+			bcpy(tbuf, sizeof tbuf, base);
+			char *dot = tbuf + strlen(tbuf);
+			while (dot > tbuf && *dot != '.') dot--;
+			if (dot > tbuf) *dot = 0;
+			bcpy(title, sizeof title, tbuf);
+		}
 		lyric_start(current, filename, artist, title, is_local);
 	}
 	// 2 = success and XMPlay may close its file: we did the I/O ourselves
