@@ -76,9 +76,19 @@ struct FFMPEG {
 	const char *codec;   // audio codec short name
 	int vw, vh;
 	const char *video_codec;
+	// audio packets the video top-up read but could not forward (decoder
+	// input full). The audio thread drains these before its own reads.
+	AVPacket *pend_a[8];
+	int pend_n;
 };
 static FFMPEG *current;
 static CRITICAL_SECTION demux_lock; // guards av_read_frame/av_seek_frame/send
+
+// video queue buffering: FF_Process tops the queue up to this depth so the
+// decode thread never starves (the audio-demand feed alone delivers video
+// packets ~just-in-time; see the post-seek judder, v1.2.43 logs)
+#define VQ_TARGET 40
+#define VQ_LOOKAHEAD_MAX 64
 
 // --------------------------------------------------------------- video state
 
@@ -224,6 +234,7 @@ static void FreeFF(FFMPEG *f)
 	}
 	if (f->frame) av_frame_free(&f->frame);
 	if (f->pkt) av_packet_free(&f->pkt);
+	for (int i = 0; i < 8; i++) if (f->pend_a[i]) av_packet_free(&f->pend_a[i]);
 	free(f->outbuf);
 	free(f);
 }
@@ -1281,6 +1292,19 @@ static DWORD WINAPI FF_Process(float *buffer, DWORD count)
 		}
 		// decoder needs more input
 		if (f->sent_eof) { f->eof = TRUE; break; }
+		// drain audio packets held back by a full decoder input, in order,
+		// ahead of any demuxer reads (keeps audio packet order intact)
+		if (f->pend_n > 0) {
+			AVPacket *pa = f->pend_a[0];
+			int pr = avcodec_send_packet(f->dec, pa);
+			if (pr == 0) {
+				for (int i = 1; i < f->pend_n; i++) f->pend_a[i - 1] = f->pend_a[i];
+				f->pend_n--;
+				av_packet_free(&pa);
+				continue; // that frame can come out of the decoder now
+			}
+			break; // still full: return what we have; XMPlay calls again
+		}
 		ret = av_read_frame(f->fmt, f->pkt);
 		if (ret >= 0) {
 			if (f->pkt->stream_index == f->vstream && video.active) {
@@ -1294,8 +1318,19 @@ static DWORD WINAPI FF_Process(float *buffer, DWORD count)
 				av_packet_unref(f->pkt); // other streams - skip
 				continue;
 			}
-			avcodec_send_packet(f->dec, f->pkt);
-			av_packet_unref(f->pkt);
+			{ int sr = avcodec_send_packet(f->dec, f->pkt);
+			  if (sr == AVERROR(EAGAIN)) {
+				  // decoder input full: hold the packet - the OLD unconditional
+				  // unref here lost audio whenever this fired
+				  AVPacket *keep = av_packet_alloc();
+				  if (keep) {
+					  av_packet_move_ref(keep, f->pkt);
+					  if (f->pend_n < 8) f->pend_a[f->pend_n++] = keep; else av_packet_free(&keep);
+				  } else av_packet_unref(f->pkt);
+				  continue;
+			  }
+			  av_packet_unref(f->pkt); // decoder took its own ref (or send failed)
+			}
 			continue;
 		}
 		if (ret == AVERROR(EAGAIN)) continue;
@@ -1305,6 +1340,47 @@ static DWORD WINAPI FF_Process(float *buffer, DWORD count)
 		video.demux_eof_seen = TRUE;
 		LeaveCriticalSection(&video.lock);
 		avcodec_send_packet(f->dec, NULL); // end of input: drain the decoder
+	}
+
+	// top the video queue up to VQ_TARGET. The demand loop above only reads
+	// what the audio request needs, so video packets arrive just-in-time
+	// (the queue hovers at 0-2 and the decode thread starves, worse after a
+	// seek when catch-up needs extra frames - the judder in the v1.2.43
+	// logs: q=0 starved=40/s dropped=15/s). A ~1.6s buffer absorbs seek
+	// catch-up and m3u8 segment stalls. Audio packets read on the way are
+	// forwarded to the decoder, held in f->pend_a when its input is full.
+	if (video.active && f->vstream >= 0 && !f->sent_eof && !f->eof) {
+		int guard = 0;
+		while (video.qcount < VQ_TARGET && guard++ < VQ_LOOKAHEAD_MAX
+			&& !f->sent_eof && f->pend_n < 8) {
+			int r2 = av_read_frame(f->fmt, f->pkt);
+			if (r2 < 0) {
+				if (r2 == AVERROR(EAGAIN)) { guard++; continue; }
+				f->sent_eof = TRUE;
+				f->demux_eof = TRUE;
+				EnterCriticalSection(&video.lock);
+				video.demux_eof_seen = TRUE;
+				LeaveCriticalSection(&video.lock);
+				avcodec_send_packet(f->dec, NULL); // end of input: drain the decoder
+				break;
+			}
+			if (f->pkt->stream_index == f->vstream) {
+				AVPacket *vp = av_packet_alloc();
+				if (vp) { av_packet_move_ref(vp, f->pkt); video_enqueue(vp); }
+				else av_packet_unref(f->pkt);
+				continue;
+			}
+			if (f->pkt->stream_index != f->stream) { av_packet_unref(f->pkt); continue; }
+			int sr = avcodec_send_packet(f->dec, f->pkt);
+			if (sr == 0) { av_packet_unref(f->pkt); continue; }
+			if (sr == AVERROR(EAGAIN)) {
+				AVPacket *keep = av_packet_alloc();
+				if (keep) { av_packet_move_ref(keep, f->pkt); f->pend_a[f->pend_n++] = keep; }
+				else av_packet_unref(f->pkt);
+				break; // held for the drain path; stop this pass
+			}
+			av_packet_unref(f->pkt); // send error: drop it
+		}
 	}
 	LeaveCriticalSection(&demux_lock);
 	return done;
@@ -1352,6 +1428,8 @@ static double WINAPI FF_SetPosition(DWORD pos)
 	f->outlen = f->outp = 0;
 	f->eof = f->sent_eof = FALSE;
 	f->demux_eof = FALSE;
+	for (int i = 0; i < 8; i++) if (f->pend_a[i]) av_packet_free(&f->pend_a[i]); // pre-seek packets are stale
+	f->pend_n = 0;
 	LeaveCriticalSection(&demux_lock);
 	video_flush(); // reposition the video too
 	video_clock_capture(t);
