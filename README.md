@@ -1,26 +1,34 @@
 # xmp-ffmpeg-video
 
 XMPlay input plugin that plays **anything FFmpeg can decode** — all audio
-formats, plus the audio track of any video file — and opens a **borderless
-video window** automatically when the file has a video stream. Powered by a
-fully **static** FFmpeg build: zero FFmpeg DLLs.
+formats, plus the audio track of any video file — and renders the video into
+**XMPlay's own visualisation area** when the file has a video stream. Powered
+by a fully **static** FFmpeg build: zero FFmpeg DLLs.
 
-This is the video-window variant of
+This is the video variant of
 [xmp-ffmpeg](https://github.com/one808/xmp-ffmpeg) (same engine, same build
 pipeline). Use **this** DLL instead of the audio-only one — not alongside.
 
 Built for **Windows XP and later** (including old CPUs without SSE2).
 
-## The video window
+## The video (XMPlay visualisation area)
 
-- **Opens automatically** when the track has a video stream; **stays hidden**
-  for audio-only tracks (and when you switch between the two).
-- **Borderless**: drag anywhere to move, drag the edges to resize (the video
-  keeps its aspect ratio, letterboxed).
-- **Fullscreen**: double-click, or `F` / `Enter`. `ESC` leaves fullscreen —
-  press `ESC` again to hide the window (playback continues).
-- Sync: the picture follows XMPlay's playback position; late frames are
+The picture is drawn into XMPlay's own vis area, not a separate window —
+XMPlay controls opening/closing/fullscreen, and the main window's stop button
+just works.
+
+- **Enable**: right-click the vis area and pick **"FFmpeg video"** once;
+  XMPlay remembers it. The picture appears for any track that has a video
+  stream; audio-only tracks stay blank.
+- **Open/close/fullscreen**: the vis area's own controls (right-click menu,
+  double-click for fullscreen). On **Stop** the area goes black instead of
+  lingering as a frozen frame.
+- **Sync**: the picture follows XMPlay's playback position; late frames are
   dropped rather than delaying the audio.
+- **Seeking**: the stream fast-forwards to the target and the catch-up frames
+  are dropped quickly; the area stays **black until the picture reaches the
+  target** (a local seek takes well under a second; a network/m3u8 seek stays
+  black for as long as the target segment takes to download).
 
 ## Features (audio side)
 

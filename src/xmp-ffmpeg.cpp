@@ -819,10 +819,10 @@ static void WINAPI FF_About(HWND win)
 {
 	char msg[512];
 	snprintf(msg, sizeof(msg), "%s %s\n\nPlays any audio format FFmpeg can decode,\n"
-		"including the audio stream of video files,\n"
-		"with an automatic borderless video window.\n\n"
-		"Video window: drag to move, drag edges to resize,\n"
-		"double-click or F/Enter = fullscreen, ESC = leave/hide.\n\n"
+		"including the audio track of video files.\n\n"
+		"Video renders into XMPlay's own visualisation area:\n"
+		"pick \"FFmpeg video\" in the vis menu; XMPlay's vis\n"
+		"controls (open/close/fullscreen) drive the picture.\n\n"
 		"FFmpeg: %s\nXMPlay plugin interface %u",
 		PLUGIN_NAME, PLUGIN_VER, av_version_info(), (unsigned)XMPIN_FACE);
 	MessageBox(win, msg, "About " PLUGIN_NAME, MB_ICONINFORMATION);
