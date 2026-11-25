@@ -23,9 +23,14 @@
 #include <ctype.h>
 
 #include <winsock2.h>
+#include <netdb.h>
 #include <windows.h>
 #include <wchar.h>
 #include "xmpin.h"
+
+#ifndef CP_936 // GBK / Chinese Simplified code page (XP-safe, from winnls.h)
+#define CP_936 936
+#endif
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -777,7 +782,7 @@ struct LYRIC {
 };
 static LYRIC lyric;
 static CRITICAL_SECTION lyric_thread_lock; // guards spawn/handle
-static HANDLE lyric_fetch_thread;
+static HANDLE lyric_fetch_handle;
 
 static char *xstrdup(const char *s)
 {
@@ -974,28 +979,28 @@ static char *http_get(const char *url)
 		bcpy(path, sizeof path, h);
 		if (!host[0] || !port || !path[0]) return 0;
 	}
-	struct addrinfo hints, *res = 0;
-	memset(&hints, 0, sizeof hints);
-	hints.ai_family = AF_INET;
-	hints.ai_socktype = SOCK_STREAM;
-	hints.ai_protocol = IPPROTO_TCP;
-	char pstr[16];
-	sprintf(pstr, "%d", port);
-	if (getaddrinfo(host, pstr, &hints, &res) != 0) return 0;
+	// resolve + connect (gethostbyname: universally available on XP/mingw;
+	// getaddrinfo is not declared by this toolchain's winsock2.h)
+	struct hostent *he = gethostbyname(host);
+	if (!he || !he->h_addr_list[0]) return 0;
 	SOCKET s = INVALID_SOCKET;
-	for (struct addrinfo *a = res; a; a = a->ai_next) {
-		s = socket(a->ai_family, a->ai_socktype, a->ai_protocol);
+	for (int i = 0; he->h_addr_list[i]; i++) {
+		struct sockaddr_in sa;
+		memset(&sa, 0, sizeof sa);
+		sa.sin_family = AF_INET;
+		sa.sin_port = htons((u_short)port);
+		memcpy(&sa.sin_addr, he->h_addr_list[i], he->h_length);
+		s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 		if (s == INVALID_SOCKET) continue;
-		if (connect(s, a->ai_addr, (int)a->ai_addrlen) == 0) break;
+		if (connect(s, (struct sockaddr*)&sa, sizeof sa) == 0) break;
 		closesocket(s);
 		s = INVALID_SOCKET;
 	}
-	freeaddrinfo(res);
 	if (s == INVALID_SOCKET) return 0;
 	{
 		DWORD to = 8000;
-		setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&to, sizeof to);
-		setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&to, sizeof to);
+		setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char*)&to, sizeof to);
+		setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (char*)&to, sizeof to);
 	}
 	char req[1400];
 	snprintf(req, sizeof req, "GET %s HTTP/1.1\r\nHost: %s:%d\r\nConnection: close\r\n"
@@ -1374,8 +1379,8 @@ static void lyric_start(FFMPEG *f, const char *filename, const char *artist, con
 		LeaveCriticalSection(&lyric.lock);
 		HANDLE h = CreateThread(0, 0, lyric_fetch_thread, c, 0, 0);
 		if (h) {
-			HANDLE old = lyric_fetch_thread;
-			lyric_fetch_thread = h;
+			HANDLE old = lyric_fetch_handle;
+			lyric_fetch_handle = h;
 			// close the previous handle only after we've handed off; the thread
 			// object outlives the handle, so closing the old one is safe
 			if (old) CloseHandle(old);
@@ -2221,7 +2226,7 @@ BOOL WINAPI DllMain(HINSTANCE hDLL, DWORD reason, LPVOID reserved)
 		break;
 	case DLL_PROCESS_DETACH:
 		if (ws_init_done) WSACleanup();
-		if (lyric_fetch_thread) CloseHandle(lyric_fetch_thread);
+		if (lyric_fetch_handle) CloseHandle(lyric_fetch_handle);
 		DeleteCriticalSection(&lyric_thread_lock);
 		DeleteCriticalSection(&lyric.lock);
 		break;
