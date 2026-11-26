@@ -2122,6 +2122,7 @@ static void video_late_scan(FFMPEG *f)
 static DWORD WINAPI FF_Process(float *buffer, DWORD count)
 {
 	FFMPEG *f = current;
+	DWORD c0 = GetTickCount(); // whole-call + call-cadence timing (pb: diagnostics)
 	if (!f) return 0;
 	video_late_scan(f);
 	// video clock: XMPlay's nominal track time. It tracks the audible audio
@@ -2141,7 +2142,6 @@ static DWORD WINAPI FF_Process(float *buffer, DWORD count)
 				f->pos, xmpfstatus ? xmpfstatus->GetTime() : -1.0);
 		}
 	}
-	DWORD w0 = GetTickCount(); // audio-pump work timing (see pb: diagnostics)
 	EnterCriticalSection(&demux_lock);
 	DWORD done = 0;
 	int ch = f->dec->ch_layout.nb_channels;
@@ -2315,19 +2315,25 @@ static DWORD WINAPI FF_Process(float *buffer, DWORD count)
 	}
 	LeaveCriticalSection(&demux_lock);
 	{
-		// audio-pump diagnostics: how long the demux+decode took and whether
-		// the buffer was left short (underrun -> a gap XMPlay hears). Printed
-		// ~5/sec so the pattern is visible. Shows whether "audio choppiness on
-		// video tracks" is the pump running long / underrunning.
+		// audio-pump diagnostics: call cadence (gap vs the expected interval for
+		// `count` samples), worst whole-call time in the window, underruns.
+		// gap >> exp means XMPlay is calling the pump late -> the sound-card
+		// buffer drains -> the "chop". gap ~ exp + a steady device buffer = fine.
 		static DWORD pb_last = 0;
+		static DWORD pb_lastcall = 0;
 		static DWORD pb_worst = 0;
 		static unsigned long pb_ur = 0;
 		DWORD now = GetTickCount();
-		DWORD dur = now - w0;
-		if (dur > pb_worst) pb_worst = dur;
+		DWORD gap = pb_lastcall ? (c0 - pb_lastcall) : 0;
+		pb_lastcall = c0;
+		DWORD exp = (DWORD)(((double)count * 1000.0) /
+			(f->dec->sample_rate ? f->dec->sample_rate : 44100));
+		DWORD tot = now - c0;
+		if (tot > pb_worst) pb_worst = tot;
 		if (done < count) pb_ur++;
 		if (now - pb_last >= 200) {
-			logmsg("pb: worst_ms=%lu underruns=%lu fpos=%.2f",
+			logmsg("pb: gap=%lu exp=%lu tot=%lu ur=%lu fpos=%.2f",
+				(unsigned long)gap, (unsigned long)exp,
 				(unsigned long)pb_worst, pb_ur, f->pos);
 			pb_last = now;
 			pb_worst = 0;
