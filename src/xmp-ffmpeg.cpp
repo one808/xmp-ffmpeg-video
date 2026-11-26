@@ -109,6 +109,10 @@ struct VIDEO {
 	                             // pop. Kept separate from `lock` so the audio
 	                             // pump never blocks on the video thread's heavy
 	                             // decode+scale critical section.
+	CRITICAL_SECTION clocklock; // the playback clock (clock_base/clock_tick),
+	                             // captured on the audio thread every pump call -
+	                             // kept off `lock` so the audio pump never waits
+	                             // on the video thread's frame scale.
 	volatile BOOL active;      // a video stream is attached
 	volatile BOOL running;     // render thread alive
 	DWORD threadid;
@@ -518,17 +522,17 @@ static void video_flush()
 static void video_clock_capture(double t)
 {
 	if (!(t > -1e6 && t < 1e7)) return; // NaN/garbage: keep interpolating
-	EnterCriticalSection(&video.lock);
+	EnterCriticalSection(&video.clocklock);
 	video.clock_base = t;
 	video.clock_tick = GetTickCount();
-	LeaveCriticalSection(&video.lock);
+	LeaveCriticalSection(&video.clocklock);
 }
 
 static double video_clock_now()
 {
-	EnterCriticalSection(&video.lock);
+	EnterCriticalSection(&video.clocklock);
 	double t = video.clock_base + (double)(GetTickCount() - video.clock_tick) * 0.001;
-	LeaveCriticalSection(&video.lock);
+	LeaveCriticalSection(&video.clocklock);
 	return t;
 }
 
@@ -2471,6 +2475,7 @@ extern "C" __declspec(dllexport) XMPIN *WINAPI XMPIN_GetInterface(DWORD face, In
 	InitializeCriticalSection(&g_loglock); // log handle + guard (cheap logmsg)
 	InitializeCriticalSection(&video.lock);
 	InitializeCriticalSection(&video.qlock);
+	InitializeCriticalSection(&video.clocklock);
 	InitializeCriticalSection(&demux_lock);
 	lrc_cfg_load(); // lyrics settings from the registry face (defaults if absent)
 	video.vframe = av_frame_alloc();
