@@ -79,6 +79,9 @@ static DWORD vis_colors[3];        // skin colors from FF_VisOpen (bg,text1,text
 //       PRESENT RATE from the audio chop)
 //   5 = DIAG: own window shown, only the FIRST frame is presented (isolates
 //       window existence from per-frame present activity)
+//   6 = GDI-ONLY: skip D3D entirely, paint the window with plain GDI (no D3D
+//       device, no 32-bit D3D UMD involvement) - use when the D3D driver is
+//       what is crashing the process
 // Used to isolate which part of the video path chokes the audio on video tracks.
 static int g_video_mode = 0;
 
@@ -898,7 +901,6 @@ static void d3d_release(void)
 }
 
 static BOOL d3d_ensure_tex(int w, int h);
-static void d3d_prime(void); // prime the driver's first present cycle (defined below)
 
 static BOOL d3d_init(HWND hwnd)
 {
@@ -929,29 +931,19 @@ static BOOL d3d_init(HWND hwnd)
 		d3d_release();
 		return FALSE;
 	}
-	d3d_prime(); // run the driver's first present cycle (see d3d_prime)
+	// NOTE: no prime present here. A Present on the (still hidden) window
+	// right after CreateDevice crashed the Intel igdumdim32 32-bit D3D
+	// driver on this machine (AV in the UMD at the first playback). The
+	// SYSTEMMEM texture below does not need a primed cycle, so we simply
+	// never present until the window is shown and real frames arrive.
 	return TRUE;
 }
 
-// Prime the device: render one empty (black) frame and Present it. This
-// completes the driver's initial present cycle so that the first real
-// texture upload is not blocked on it. (With a SYSTEMMEM texture the lock
-// does not deadlock, but the first present still warms up the back buffer
-// and the compositing path - without this, the first real frame can arrive
-// a beat late or the surface stays uninitialised on some drivers.)
-static void d3d_prime(void)
-{
-	if (!d3dev) return;
-	HRESULT tl = d3dev->TestCooperativeLevel();
-	if (tl == D3DERR_DEVICELOST || tl == D3DERR_DEVICENOTRESET)
-		if (d3dev->Reset(&d3pp) != D3D_OK) return;
-	d3dev->SetRenderTarget(0, 0);
-	d3dev->BeginScene();
-	d3dev->Clear(0, 0, D3DCLEAR_TARGET, 0xFF000000, -1.0f, 0);
-	d3dev->EndScene();
-	HRESULT ph = d3dev->Present(0, 0, 0, 0);
-	logmsg("dv: d3d_prime present hr=0x%08X", (unsigned)ph);
-}
+// NOTE: a "prime" present (rendering one black frame right after
+// CreateDevice / after a reset) was tried and removed: on this machine it
+// crashed the Intel igdumdim32 32-bit D3D driver (AV in the UMD). The
+// SYSTEMMEM texture below does not need a primed present cycle, so the
+// device simply waits for its first real frame.
 
 static BOOL d3d_ensure_tex(int w, int h)
 {
@@ -1007,7 +999,8 @@ static void d3d_present(void)
 			return;
 		}
 		if (d3tex) { d3tex->Release(); d3tex = 0; }
-		d3d_prime(); // re-run the first present cycle after the reset
+		// no prime present after the reset either (see d3d_init): the first
+		// real frame's own present is enough to complete the cycle.
 	}
 	if (!d3d_ensure_tex(video.dibw, video.dibh)) return;
 
@@ -1182,7 +1175,6 @@ static BOOL video_fullscreen_exclusive_on()
 	SetWindowPos(video.hwnd, HWND_TOPMOST, mi.rcMonitor.left, mi.rcMonitor.top,
 		mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
 		SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_NOACTIVATE);
-	d3d_prime();
 	logmsg("dv: exclusive fullscreen on (%ux%u)",
 		fspp.BackBufferWidth, fspp.BackBufferHeight);
 	return TRUE;
@@ -1204,7 +1196,6 @@ static void video_fullscreen_exclusive_off()
 	SetWindowLong(video.hwnd, GWL_STYLE, WS_POPUP | WS_THICKFRAME | WS_VISIBLE);
 	SetWindowLong(video.hwnd, GWL_EXSTYLE,
 		GetWindowLong(video.hwnd, GWL_EXSTYLE) & ~WS_EX_TOPMOST);
-	d3d_prime();
 	logmsg("dv: exclusive fullscreen off");
 }
 
@@ -1317,22 +1308,29 @@ static LRESULT CALLBACK video_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 		}
 		ShowWindow(video.hwnd, SW_SHOW);
 		video.win_visible = TRUE;
-		if (!d3dev) d3d_init(hwnd); // re-wake the device (powered down on hide)
+		if (!d3dev && g_video_mode != 6) d3d_init(hwnd); // re-wake the device
 		video_round_corners(hwnd);
 		return 0;
 	}
 	case WM_APP_VHIDE:
+		// leaving exclusive first: a hidden window must not hold the display
+		// in D3D exclusive mode (the track that follows may be audio-only)
+		if (!d3dev) {
+			video.hidden = TRUE;
+			video.win_visible = FALSE;
+			ShowWindow(hwnd, SW_HIDE);
+			return 0;
+		}
+		if (!d3pp.Windowed) video_fullscreen_exclusive_off();
+		video.fullscreen = FALSE;
 		video.hidden = TRUE;
 		video.win_visible = FALSE;
 		ShowWindow(hwnd, SW_HIDE);
-		if (!video.fullscreen) {
-			// AUDIO-PRIORITY POWER DOWN: the user hid the picture (ESC) - the
-			// decode thread is already idling, and now the D3D device + its
-			// driver/DWM registration go away too, so the audio path returns
-			// to pure-audio-track behavior until the next show.
-			d3d_release();
-			logmsg("dv: video hidden -> D3D device released (audio-priority idle)");
-		}
+		// The decode thread now idles and no VPRESENT is posted, so the GPU
+		// sees no per-frame work. We deliberately do NOT destroy/recreate the
+		// D3D device here: repeated CreateDevice/DestroyDevice cycles stress
+		// a buggy 32-bit D3D UMD (the Intel driver on this box), and an idle
+		// device is far safer than one being torn down.
 		return 0;
 	case WM_APP_VBLANK:
 		video_blank();
@@ -1384,8 +1382,11 @@ static DWORD WINAPI video_wnd_thread(LPVOID)
 		CW_USEDEFAULT, CW_USEDEFAULT, 640, 480, 0, 0, wc.hInstance, 0);
 	if (!h) return 1;
 	video.hwnd = h;
-	d3d_init(h); // prefer GPU rendering; on failure we fall back to GDI paint
-	logmsg("cb: window render=%s", d3dev ? "d3d" : "gdi");
+	// GDI-only mode (VideoMode=6) skips D3D entirely: no D3D device, no UMD
+	// driver involvement - the picture is painted with plain GDI. Use this
+	// when the 32-bit D3D driver is the thing crashing the process.
+	if (g_video_mode != 6) d3d_init(h); // prefer GPU rendering; else GDI paint
+	logmsg("cb: window render=%s", d3dev ? "d3d" : (g_video_mode == 6 ? "gdi(forced)" : "gdi"));
 	if (video.active)
 		PostMessage(h, WM_APP_VSHOW, 0, 0); // a track is attached but our VSHOW
 	                                          // may have been lost before we existed
@@ -2686,7 +2687,7 @@ static DWORD WINAPI FF_Open(const char *filename, XMPFILE file)
 	// read the bisection switch each open so it can be flipped without a rebuild
 	{ int vm = 0;
 	  if (xmpfreg && xmpfreg->GetInt(LRC_REGSEC, "VideoMode", &vm))
-		  g_video_mode = (vm >= 0 && vm <= 5) ? vm : 0;
+		  g_video_mode = (vm >= 0 && vm <= 6) ? vm : 0;
 	  else g_video_mode = 0;
 	  logmsg("cb: VideoMode=%d", g_video_mode); }
 	if (g_video_mode != 2)
