@@ -105,6 +105,10 @@ struct VPKT { VPKT *next; AVPacket *pkt; };
 
 struct VIDEO {
 	CRITICAL_SECTION lock;
+	CRITICAL_SECTION qlock;     // fast packet-queue lock: audio enqueue / video
+	                             // pop. Kept separate from `lock` so the audio
+	                             // pump never blocks on the video thread's heavy
+	                             // decode+scale critical section.
 	volatile BOOL active;      // a video stream is attached
 	volatile BOOL running;     // render thread alive
 	DWORD threadid;
@@ -464,9 +468,9 @@ static void video_enqueue(AVPacket *pkt)
 	if (!n) { av_packet_free(&pkt); return; }
 	n->next = 0;
 	n->pkt = pkt;
-	EnterCriticalSection(&video.lock);
+	EnterCriticalSection(&video.qlock);
 	if (video.qcount > 600) { // bounded queue: drop the new packet instead of
-		LeaveCriticalSection(&video.lock); // growing without limit
+		LeaveCriticalSection(&video.qlock); // growing without limit
 		av_packet_free(&pkt);
 		free(n);
 		return;
@@ -474,16 +478,20 @@ static void video_enqueue(AVPacket *pkt)
 	if (video.qtail) video.qtail->next = n; else video.qhead = n;
 	video.qtail = n;
 	video.qcount++;
-	LeaveCriticalSection(&video.lock);
+	LeaveCriticalSection(&video.qlock);
 }
 
 static void video_flush()
 {
-	EnterCriticalSection(&video.lock);
+	// queue under the fast lock; decoder state under the display lock. Taken
+	// sequentially (never nested) to keep the two locks independent.
+	EnterCriticalSection(&video.qlock);
 	VPKT *p = video.qhead;
 	while (p) { VPKT *n = p->next; av_packet_free(&p->pkt); free(p); p = n; }
 	video.qhead = video.qtail = 0;
 	video.qcount = 0;
+	LeaveCriticalSection(&video.qlock);
+	EnterCriticalSection(&video.lock);
 	video.have_frame = FALSE;
 	video.v_eof_sent = video.demux_eof_seen = FALSE;
 	video.last_pts = -1; // new timeline after a seek
@@ -558,75 +566,95 @@ static void video_tick()
 {
 	if (!video.active || !video.vdec) return;
 	double t = video_clock_now();
-	EnterCriticalSection(&video.lock);
-	if (!video.active || !video.vdec) { LeaveCriticalSection(&video.lock); return; }
 	int budget = 8; // max decode/feed iterations this tick
 	int nstarve = 0, ndrop = 0;
 	double shown_pts = -1;
+	// The heavy avcodec decode + sws_scale now run OUTSIDE the display lock:
+	// only the packet pop takes the fast queue lock, and only the dib/flag
+	// bookkeeping takes video.lock. So the audio thread's video_enqueue
+	// (qlock) is never held up by a decode/scale burst - the root cause of the
+	// "video track -> audio choppiness" underrun.
 	while (budget-- > 0) {
 		if (!video.have_frame) {
 			int ret = avcodec_receive_frame(video.vdec, video.vframe);
 			if (ret == AVERROR(EAGAIN)) {
-				// feed one packet (or the drain marker at demux EOF)
-				if (video.qhead) {
-					VPKT *n = video.qhead;
-					video.qhead = n->next;
-					if (!video.qhead) video.qtail = 0;
-					video.qcount--;
+				VPKT *n = 0;
+				{
+					EnterCriticalSection(&video.qlock);
+					if (video.qhead) {
+						n = video.qhead;
+						video.qhead = n->next;
+						if (!video.qhead) video.qtail = 0;
+						video.qcount--;
+					}
+					LeaveCriticalSection(&video.qlock);
+				}
+				if (n) {
 					if (avcodec_send_packet(video.vdec, n->pkt) == AVERROR(EAGAIN)) {
-						// decoder is full - put the packet back and drain first
+						// decoder full - put the packet back, drain first
+						EnterCriticalSection(&video.qlock);
 						n->next = video.qhead;
 						video.qhead = n;
 						if (!video.qtail) video.qtail = n;
 						video.qcount++;
+						LeaveCriticalSection(&video.qlock);
 						break;
 					}
 					av_packet_free(&n->pkt);
 					free(n);
 					continue;
 				}
-				if (video.demux_eof_seen && !video.v_eof_sent) {
-					video.v_eof_sent = TRUE;
-					avcodec_send_packet(video.vdec, NULL);
-					continue;
+				{ // queue empty: drain marker at demux EOF, else starve
+					EnterCriticalSection(&video.lock);
+					if (video.demux_eof_seen && !video.v_eof_sent) {
+						video.v_eof_sent = TRUE;
+						LeaveCriticalSection(&video.lock);
+						avcodec_send_packet(video.vdec, NULL);
+						continue;
+					}
+					LeaveCriticalSection(&video.lock);
 				}
 				nstarve++;
 				break; // starved - wait for more packets
 			}
 			if (ret < 0) break; // drained or error
-			// timestamp: real pts when present, else advance from the last one
-			double pts;
-			if (video.vframe->best_effort_timestamp != AV_NOPTS_VALUE) {
-				pts = video.vframe->best_effort_timestamp * av_q2d(video.tb);
-			} else {
-				pts = video.last_pts + video.frame_dur;
+			EnterCriticalSection(&video.lock);
+			{
+				double pts;
+				if (video.vframe->best_effort_timestamp != AV_NOPTS_VALUE)
+					pts = video.vframe->best_effort_timestamp * av_q2d(video.tb);
+				else
+					pts = video.last_pts + video.frame_dur;
+				if (pts > video.last_pts) video.last_pts = pts;
+				video.frame_pts = pts;
+				video.frame_sar = video.vframe->sample_aspect_ratio;
 			}
-			if (pts > video.last_pts) video.last_pts = pts;
-			video.frame_pts = pts;
-			video.frame_sar = video.vframe->sample_aspect_ratio;
+			LeaveCriticalSection(&video.lock);
 			video.have_frame = TRUE;
 			continue;
 		}
 		// have a decoded frame: show it when due, drop when far too late.
-		// While a seek catch-up is in progress the drop budget is unlimited:
-		// stale frames must NOT be shown (they'd flash old content and clear
-		// `seeking` early) - keep the area black until a frame in the target
-		// window is shown.
-		if (video.frame_pts > t + 0.06) break;   // in the future - wait
+		EnterCriticalSection(&video.lock);
+		if (video.frame_pts > t + 0.06) { // in the future - wait
+			LeaveCriticalSection(&video.lock);
+			break;
+		}
 		if (video.frame_pts < t - 0.30 && (budget > 2 || video.seeking)) { // behind - drop
 			video.have_frame = FALSE;
 			ndrop++;
+			LeaveCriticalSection(&video.lock);
 			continue;
 		}
-		video_render_frame(); // scale into video.dib (under lock); sets have_new
+		video_render_frame(); // scale into video.dib; sets have_new
 		shown_pts = video.frame_pts;
-		if (video.seeking) video.seeking = FALSE; // a shown frame is within the
-		                                         // clock window - catch-up done
+		if (video.seeking) video.seeking = FALSE; // catch-up done
 		video.have_frame = FALSE;
+		LeaveCriticalSection(&video.lock);
 		break; // one present per tick is enough
 	}
+	EnterCriticalSection(&video.qlock);
 	int qnow = video.qcount;
-	LeaveCriticalSection(&video.lock);
+	LeaveCriticalSection(&video.qlock);
 	// 1/sec diagnostic heartbeat: queue depth + per-second starvation/drop
 	// counts, used to diagnose the post-seek judder (%TEMP%\xmp-ffmpeg-video.log)
 	{
@@ -712,17 +740,21 @@ static void video_attach(FFMPEG *f)
 // hide + disengage (Close / audio-only / teardown)
 static void video_detach()
 {
+	// stop the render thread first (it checks video.active every tick), so no
+	// new packets are enqueued after we clear the queue below.
 	EnterCriticalSection(&video.lock);
 	video.active = FALSE;
-	VPKT *p = video.qhead;
-	while (p) { VPKT *n = p->next; av_packet_free(&p->pkt); free(p); p = n; }
-	video.qhead = video.qtail = 0; video.qcount = 0;
 	video.have_frame = FALSE;
 	video.vdec = 0; video.fmt = 0;
 	video.have_new = FALSE;
 	video.vis_blank = FALSE;
 	video.seeking = FALSE; // stop the fast catch-up cadence
 	LeaveCriticalSection(&video.lock);
+	EnterCriticalSection(&video.qlock);
+	VPKT *p = video.qhead;
+	while (p) { VPKT *n = p->next; av_packet_free(&p->pkt); free(p); p = n; }
+	video.qhead = video.qtail = 0; video.qcount = 0;
+	LeaveCriticalSection(&video.qlock);
 }
 
 // ================================================================ lyrics layer
@@ -2402,6 +2434,7 @@ extern "C" __declspec(dllexport) XMPIN *WINAPI XMPIN_GetInterface(DWORD face, In
 	xmpfreg   = (XMPFUNC_REGISTRY*)faceproc(XMPFUNC_REGISTRY_FACE);
 	xmpver = xmpfmisc->GetVersion();
 	InitializeCriticalSection(&video.lock);
+	InitializeCriticalSection(&video.qlock);
 	InitializeCriticalSection(&demux_lock);
 	lrc_cfg_load(); // lyrics settings from the registry face (defaults if absent)
 	video.vframe = av_frame_alloc();
