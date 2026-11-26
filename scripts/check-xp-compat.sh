@@ -30,7 +30,7 @@ for f in "$@"; do
 	# zero-dependency rule: only Windows system DLLs may be imported - catch
 	# libstdc++-6.dll / libgcc_s_*.dll / libwinpthread-1.dll and friends.
 	bad=$(grep -i "DLL Name" <<<"$dump" | awk '{print $3}' | sort -u | \
-		grep -viE '^(advapi32|bcrypt|comctl32|comdlg32|crypt32|gdi32|imm32|iphlpapi|kernel32|mpr|msvcrt|msvfw32|netapi32|ntdll|ole32|oleaut32|psapi|rpcrt4|secur32|setupapi|shell32|shlwapi|user32|userenv|uuid|version|wininet|winmm|winspool|wintrust|ws2_32|wsock32|avicap32|avifil32)\.dll$' || true)
+		grep -viE '^(advapi32|bcrypt|comctl32|comdlg32|crypt32|d3d9|gdi32|imm32|iphlpapi|kernel32|mpr|msvcrt|msvfw32|netapi32|ntdll|ole32|oleaut32|psapi|rpcrt4|secur32|setupapi|shell32|shlwapi|user32|userenv|uuid|version|wininet|winmm|winspool|wintrust|ws2_32|wsock32|avicap32|avifil32)\.dll$' || true)
 	if [[ -n $bad ]]; then
 		echo "  FAIL: non-system DLL dependency:"; sed 's/^/    /' <<<"$bad"; fail=1
 	fi

@@ -66,11 +66,12 @@ static DWORD vis_colors[3];        // skin colors from FF_VisOpen (bg,text1,text
 #define WM_APP_VBLANK  (WM_APP + 3) // clear the picture to black
 #define WM_APP_VPRESENT (WM_APP + 4) // a fresh frame is in the DIB: repaint
 // bisection switch ("FFmpeg video"/VideoMode in XMPlay's registry face):
-//   0 = full video in the plugin's own D3D window (default). Audio-priority:
-//       when the window is hidden (ESC / audio-only) the D3D device is released
-//       so the audio path returns to pure-audio behavior; F / double-click
-//       switches to EXCLUSIVE fullscreen (no DWM) for the cleanest audio
-//       while actually watching.
+//   0 = full video in the plugin's own window, rendered by the SDL2
+//       D3D-backed renderer (statically linked - still a single-file plugin).
+//       Audio-priority: hidden window / audio-only idles the GPU; F /
+//       double-click switches to EXCLUSIVE fullscreen (no DWM) for the
+//       cleanest audio while watching. If SDL is unavailable the window falls
+//       back to plain GDI paint.
 //   1 = video attached but NO decode thread
 //   2 = play as audio-only (no video attach; LRC lyrics show instead)
 //   3 = decode runs, but the GDI blit to the vis area is skipped (picture
@@ -82,7 +83,11 @@ static DWORD vis_colors[3];        // skin colors from FF_VisOpen (bg,text1,text
 //   6 = GDI-ONLY: skip D3D entirely, paint the window with plain GDI (no D3D
 //       device, no 32-bit D3D UMD involvement) - use when the D3D driver is
 //       what is crashing the process
-// Used to isolate which part of the video path chokes the audio on video tracks.
+//   7 = hand-rolled D3D (EXPERIMENT): the pre-SDL D3D path, kept for testing
+//       on machines whose D3D driver does NOT have the Intel UMD crash
+// 0..2,4,5,6,7 select the video behavior; 0 = SDL renderer with GDI fallback,
+// 1 = attached but no decode thread, 2 = audio-only (LRC lyrics), 3/4/5 are
+// diagnostic isolation modes. Default 0.
 static int g_video_mode = 0;
 
 struct FFMPEG {
@@ -877,13 +882,120 @@ static void video_blank()
 	InvalidateRect(video.hwnd, 0, FALSE); // repaint on the window thread
 }
 
-// --------------------------------------------------------------- D3D renderer
-// The video is blitted with Direct3D, NOT GDI: per-frame GDI (StretchDIBits /
-// BitBlt) takes the global GDI lock and, on this machine, jitters the audio
-// path. D3D uploads the frame to a texture and presents it on the GPU - no GDI
-// lock, so the audio stays smooth. d3d9.dll is loaded DYNAMICALLY (never in
-// the import table) so the XP-compat audit stays clean; if D3D is unavailable
-// we fall back to the GDI paint (video_paint).
+// --------------------------------------------------------------- SDL2 renderer
+// FIRST-CHOICE renderer: SDL2's D3D9-backed renderer, STATICALLY linked
+// (libSDL2.a - no extra DLL, still a single-file plugin). Our hand-rolled
+// D3D call patterns crash this machine's Intel 32-bit D3D UMD
+// (igdumdim32.dll AV at a fixed offset); SDL manages the same windowed-D3D
+// effect with a driver-safe lifecycle order. GDI paint stays as fallback.
+#include <SDL.h>
+#include <SDL_syswm.h>
+static SDL_Window   *sdl_win = 0;
+static SDL_Renderer *sdl_ren = 0;
+static SDL_Texture  *sdl_tex = 0;
+static int sdl_tex_w = 0, sdl_tex_h = 0;
+
+static void sdl_release(void)
+{
+	if (sdl_tex) { SDL_DestroyTexture(sdl_tex); sdl_tex = 0; }
+	if (sdl_ren) { SDL_DestroyRenderer(sdl_ren); sdl_ren = 0; }
+	if (sdl_win) { SDL_DestroyWindow(sdl_win); sdl_win = 0; }
+}
+
+// create the SDL window + renderer (window thread). GPU renderer first, then
+// SDL's software renderer - both keep the picture off the GDI blit path.
+static BOOL sdl_setup(int w, int h)
+{
+	if (sdl_ren) return TRUE;
+	if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+		logmsg("dv: SDL_Init failed: %s", SDL_GetError());
+		return FALSE;
+	}
+	sdl_win = SDL_CreateWindow("FFmpeg video", SDL_WINDOWPOS_CENTERED,
+		SDL_WINDOWPOS_CENTERED, w, h,
+		SDL_WINDOW_BORDERLESS | SDL_WINDOW_RESIZABLE);
+	if (!sdl_win) {
+		logmsg("dv: SDL_CreateWindow failed: %s", SDL_GetError());
+		return FALSE;
+	}
+	sdl_ren = SDL_CreateRenderer(sdl_win, -1, SDL_RENDERER_ACCELERATED);
+	if (!sdl_ren)
+		sdl_ren = SDL_CreateRenderer(sdl_win, -1, 0); // software fallback
+	if (sdl_ren) {
+		logmsg("dv: SDL renderer ok (%s)", SDL_GetRendererName(sdl_ren));
+		return TRUE;
+	}
+	logmsg("dv: SDL renderer failed: %s", SDL_GetError());
+	return FALSE;
+}
+
+// the native HWND behind the SDL window (for docking / GDI interop)
+static HWND sdl_native(void)
+{
+	if (!sdl_win) return 0;
+	SDL_SysWMinfo si;
+	if (SDL_GetWindowWMInfo(sdl_win, &si) == SDL_TRUE)
+		return si.info.win.win_window;
+	return 0;
+}
+
+static BOOL sdl_ensure_tex(int w, int h)
+{
+	if (!sdl_ren || w < 1 || h < 1) return FALSE;
+	if (sdl_tex && sdl_tex_w == w && sdl_tex_h == h) return TRUE;
+	if (sdl_tex) { SDL_DestroyTexture(sdl_tex); sdl_tex = 0; }
+	// the DIB is BGRA in memory; SDL_PIXELFORMAT_BGRA8888 matches byte order
+	if (SDL_CreateTexture(sdl_ren, SDL_PIXELFORMAT_BGRA8888,
+		SDL_TEXTUREACCESS_STREAMING, w, h) != 0) {
+		logmsg("dv: SDL_CreateTexture failed: %s", SDL_GetError());
+		return FALSE;
+	}
+	sdl_tex_w = w; sdl_tex_h = h;
+	return TRUE;
+}
+
+// upload the current DIB + letterboxed present (window thread)
+static void sdl_present(void)
+{
+	if (!sdl_ren || !video.dib || video.dibw < 1 || !video.dibh) return;
+	if (!sdl_ensure_tex(video.dibw, video.dibh)) return;
+	if (SDL_UpdateTexture(sdl_tex, 0, video.dib, video.dibw * 4) != 0) {
+		static DWORD s_log = 0;
+		DWORD now = GetTickCount();
+		if (now - s_log >= 1000) {
+			s_log = now;
+			logmsg("dv: SDL_UpdateTexture failed: %s", SDL_GetError());
+		}
+		return;
+	}
+	int cw, ch;
+	{ HWND nh = sdl_native();
+		RECT rc; GetClientRect(nh, &rc); cw = rc.right; ch = rc.bottom; }
+	if (cw < 1 || ch < 1) return;
+	double va = (double)video.dibw / video.dibh, wa = (double)cw / ch;
+	int vw = cw, vh2 = ch, vx = 0, vy = 0;
+	if (wa > va) { vw = (int)(ch * va + 0.5); vx = (cw - vw) / 2; }
+	else         { vh2 = (int)(cw / va + 0.5); vy = (ch - vh2) / 2; }
+	SDL_RenderClear(sdl_ren);
+	SDL_RenderCopy(sdl_ren, sdl_tex, 0, &(SDL_Rect){ vx, vy, vw, vh2 });
+	SDL_RenderPresent(sdl_ren);
+}
+
+// exclusive fullscreen (no DWM): SDL's D3D backend handles the exclusive
+// reset; on refusal SDL stays in desktop (borderless) fullscreen.
+static void sdl_fullscreen_toggle(void)
+{
+	if (!sdl_win) return;
+	if (SDL_GetWindowFlags(sdl_win) & SDL_WINDOW_FULLSCREEN_EXCLUSIVE)
+		SDL_SetWindowFullscreen(sdl_win, 0);
+	else
+		SDL_SetWindowFullscreen(sdl_win, SDL_WINDOW_FULLSCREEN_EXCLUSIVE);
+	logmsg("dv: SDL fullscreen -> %s",
+		(SDL_GetWindowFlags(sdl_win) & SDL_WINDOW_FULLSCREEN_EXCLUSIVE)
+			? "exclusive" : "windowed/desktop");
+}
+
+
 static HMODULE d3d_mod = 0;
 static IDirect3D9 *d3d = 0;
 static IDirect3DDevice9 *d3dev = 0;
@@ -1308,7 +1420,7 @@ static LRESULT CALLBACK video_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 		}
 		ShowWindow(video.hwnd, SW_SHOW);
 		video.win_visible = TRUE;
-		if (!d3dev && g_video_mode != 6) d3d_init(hwnd); // re-wake the device
+		if (!d3dev && g_video_mode == 7) d3d_init(hwnd); // re-wake the D3D device
 		video_round_corners(hwnd);
 		return 0;
 	}
@@ -1358,13 +1470,135 @@ static LRESULT CALLBACK video_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 	return DefWindowProc(hwnd, msg, wp, lp);
 }
 
-// the window thread: owns the video window + its message loop (and the GDI
-// paint that comes with it). Runs below the audio so the window's own work
-// never delays the audio pump either.
+// --------------------------------------------------------------------- glue
+// The window thread owns the video window + its message loop + the renderer.
+// Three render paths, chosen at thread start:
+//   1. SDL2 (preferred, VideoMode 0): SDL creates the window + a D3D-backed
+//      (or software) renderer. We SUBCLASS SDL's window proc so our four
+//      WM_APP_* messages (posted by the decode/attach threads) reach us, and
+//      everything else chains to SDL's original proc. Keys/mouse come from
+//      SDL's event queue, drained alongside the native message pump.
+//   2. hand-rolled D3D (fallback, VideoMode 7 / when SDL is unavailable):
+//      the native borderless window + our own D3D device.
+//   3. GDI only (VideoMode 6): the native window painted with GDI - the last
+//      resort when the 32-bit D3D UMD is what crashing the process.
+static WNDPROC g_sdl_orig_proc = 0;
+
+// the four command messages, routed by the subclass when running under SDL
+static LRESULT sdl_msg_handler(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+	switch (msg) {
+	case WM_APP_VSHOW: {
+		xmpwin = find_xmpwin();
+		if (xmpwin) SetWindowLong(hwnd, GWL_HWNDPARENT, (LONG)xmpwin);
+		video.hidden = FALSE;
+		if (!video.size_set) {
+			SDL_SetWindowSize(sdl_win, video.show_w, video.show_h);
+			video.size_set = TRUE;
+		}
+		SDL_ShowWindow(sdl_win);
+		video.win_visible = TRUE;
+		return 0;
+	}
+	case WM_APP_VHIDE:
+		video.hidden = TRUE;
+		video.win_visible = FALSE;
+		// a hidden window must not keep the display in D3D exclusive mode
+		if (sdl_win && (SDL_GetWindowFlags(sdl_win) & SDL_WINDOW_FULLSCREEN_EXCLUSIVE))
+			SDL_SetWindowFullscreen(sdl_win, 0);
+		if (sdl_win) SDL_HideWindow(sdl_win);
+		return 0;
+	case WM_APP_VBLANK:
+		if (video.dib) memset(video.dib, 0, (size_t)video.dibw * video.dibh * 4);
+		if (sdl_ren) {
+			SDL_RenderClear(sdl_ren);
+			SDL_RenderPresent(sdl_ren);
+		}
+		return 0;
+	case WM_APP_VPRESENT:
+		if (video.present_throttle_ms &&
+			(GetTickCount() - video.last_present_ms) < (DWORD)video.present_throttle_ms)
+			return 0;
+		video.last_present_ms = GetTickCount();
+		sdl_present();
+		return 0;
+	}
+	return 1; // unhandled: fall through to SDL
+}
+
+// the subclass: our commands are handled, everything else chains to SDL
+static LRESULT CALLBACK sdl_sub_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+	if (msg >= WM_APP_VSHOW && msg <= WM_APP_VPRESENT)
+		return sdl_msg_handler(hwnd, msg, wp, lp);
+	return CallWindowProc(g_sdl_orig_proc, hwnd, msg, wp, lp);
+}
+
+// SDL events -> the window controls (F / Enter fullscreen, ESC, dbl-click)
+static void sdl_pump_keys(void)
+{
+	if (!sdl_win) return;
+	SDL_PumpEvents(); // process OS window messages into SDL's event queue
+	SDL_Event e;
+	while (SDL_PollEvent(&e)) {
+		switch (e.type) {
+		case SDL_KEYDOWN:
+			if (e.key.keysym.sym == SDLK_f || e.key.keysym.sym == SDLK_RETURN ||
+				e.key.keysym.sym == SDLK_KP_ENTER)
+				sdl_fullscreen_toggle();
+			else if (e.key.keysym.sym == SDLK_ESCAPE) {
+				if (SDL_GetWindowFlags(sdl_win) & SDL_WINDOW_FULLSCREEN_EXCLUSIVE)
+					SDL_SetWindowFullscreen(sdl_win, 0);
+				else {
+					video.hidden = TRUE; video.win_visible = FALSE;
+					SDL_HideWindow(sdl_win);
+				}
+			}
+			break;
+		case SDL_MOUSEBUTTONDOWN:
+			if (e.button.clicks == 2) sdl_fullscreen_toggle();
+			break;
+		default:
+			break;
+		}
+	}
+}
+
+// the window thread: owns the video window + its message loop + the renderer.
+// Runs below the audio so the window's own work never delays the audio pump.
 static DWORD WINAPI video_wnd_thread(LPVOID)
 {
 	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
 	QueryPerformanceFrequency(&g_prqf);
+
+	// ------------------------------------------------- path 1: SDL2 renderer
+	if (g_video_mode != 6) {
+		// GDI-only (mode 6) skips GPU entirely; otherwise try SDL first
+		if (sdl_setup(640, 480)) {
+			HWND h = sdl_native();
+			if (!h) { sdl_release(); }
+			else {
+				video.hwnd = h;
+				g_sdl_orig_proc = (WNDPROC)GetWindowLongPtr(h, GWLP_WNDPROC);
+				SetWindowLongPtr(h, GWLP_WNDPROC, (LONG_PTR)sdl_sub_proc);
+				if (video.active)
+					PostMessage(h, WM_APP_VSHOW, 0, 0);
+				MSG m;
+				while (GetMessage(&m, 0, 0, 0) > 0) {
+					TranslateMessage(&m);
+					DispatchMessage(&m); // routes WM_APP_* via sdl_sub_proc,
+					                     // all else to SDL's proc
+					sdl_pump_keys();     // SDL event queue (F / ESC / dblclick)
+				}
+				sdl_release();
+				return 0;
+			}
+		} else if (g_video_mode == 0) {
+			logmsg("dv: SDL unavailable -> native D3D fallback");
+		}
+	}
+
+	// ---------------------------- paths 2/3: native window (D3D or GDI-only)
 	WNDCLASSEX wc;
 	memset(&wc, 0, sizeof wc);
 	wc.cbSize = sizeof wc;
@@ -1382,10 +1616,11 @@ static DWORD WINAPI video_wnd_thread(LPVOID)
 		CW_USEDEFAULT, CW_USEDEFAULT, 640, 480, 0, 0, wc.hInstance, 0);
 	if (!h) return 1;
 	video.hwnd = h;
-	// GDI-only mode (VideoMode=6) skips D3D entirely: no D3D device, no UMD
-	// driver involvement - the picture is painted with plain GDI. Use this
-	// when the 32-bit D3D driver is the thing crashing the process.
-	if (g_video_mode != 6) d3d_init(h); // prefer GPU rendering; else GDI paint
+	// mode 7 = hand-rolled D3D experiment (the path that crashes this
+	// machine's Intel 32-bit D3D UMD - kept for testing only). Every other
+	// mode paints with GDI on the native window; the SDL path above already
+	// handles the GPU rendering for mode 0.
+	if (g_video_mode == 7) d3d_init(h);
 	logmsg("cb: window render=%s", d3dev ? "d3d" : (g_video_mode == 6 ? "gdi(forced)" : "gdi"));
 	if (video.active)
 		PostMessage(h, WM_APP_VSHOW, 0, 0); // a track is attached but our VSHOW
@@ -2687,7 +2922,7 @@ static DWORD WINAPI FF_Open(const char *filename, XMPFILE file)
 	// read the bisection switch each open so it can be flipped without a rebuild
 	{ int vm = 0;
 	  if (xmpfreg && xmpfreg->GetInt(LRC_REGSEC, "VideoMode", &vm))
-		  g_video_mode = (vm >= 0 && vm <= 6) ? vm : 0;
+		  g_video_mode = (vm >= 0 && vm <= 7) ? vm : 0;
 	  else g_video_mode = 0;
 	  logmsg("cb: VideoMode=%d", g_video_mode); }
 	if (g_video_mode != 2)

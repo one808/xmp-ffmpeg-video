@@ -51,6 +51,9 @@ jobs:
       - name: Build toolchain + FFmpeg
         run: bash scripts/build-ffmpeg.sh
 
+      - name: Build SDL2 (static, video+render)
+        run: bash scripts/build-sdl2.sh
+
       - name: Build plugin
         run: bash scripts/build-plugin.sh
 

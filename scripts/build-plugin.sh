@@ -23,7 +23,7 @@ $TRIPLE-windres -O coff build/xmp-ffmpeg.rc build/xmp-ffmpeg-res.o
 echo "== compiling xmp-ffmpeg.cpp =="
 $TRIPLE-g++ $CFLAGS_XP $DEFS_XP -Os -fno-exceptions -fno-rtti \
 	-DXMP_FFMPEG_VERSION=\"$VER\" \
-	-Ixmp-sdk -I"$PREFIX/include" \
+	-Ixmp-sdk -I"$PREFIX/include" -I"$PREFIX/include/SDL2" \
 	-c src/xmp-ffmpeg.cpp -o build/xmp-ffmpeg.o
 
 echo "== linking xmp-ffmpeg.dll (static) =="
@@ -35,12 +35,16 @@ export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig"
 export PKG_CONFIG_LIBDIR=
 FFLIBS=$(pkg-config --static --libs libavformat libavcodec libswresample libswscale libavutil)
 echo "link libs: $FFLIBS"
+# SDL2 (static, video+render only) - the video window's renderer. Its D3D9
+# backend pulls in -ld3d9; -lversion is used by SDL's Windows video driver.
+SDL2A="$PREFIX/lib/libSDL2.a"
+test -f "$SDL2A" || { echo "ERROR: $SDL2A missing (run scripts/build-sdl2.sh first)"; exit 1; }
 # g++ driver + -static-libstdc++/-static-libgcc: the dep .pc files pull in
 # -lstdc++ (gme is C++), and we must NOT end up importing libstdc++-6.dll /
 # libgcc_s_*.dll - everything goes into this single DLL.
 $TRIPLE-g++ -shared -o build/xmp-ffmpeg.dll build/xmp-ffmpeg.o build/xmp-ffmpeg-res.o \
 	-Wl,--kill-at -static-libstdc++ -static-libgcc $FFLIBS \
-	-lssp -latomic -lgdi32 -luser32 -lws2_32
+	"$SDL2A" -ld3d9 -lversion -lssp -latomic -lgdi32 -luser32 -lws2_32
 
 # sanity: the VERSIONINFO resource must be embedded (XMPlay reads it).
 # Binary UTF-16-aware check - `strings` misses short versions like "1.1"
