@@ -90,6 +90,16 @@ static DWORD vis_colors[3];        // skin colors from FF_VisOpen (bg,text1,text
 // diagnostic isolation modes. Default 0.
 static int g_video_mode = 0;
 
+// audio routing ("FFmpeg video"/AudioRoute in XMPlay's registry face):
+//   0 = auto: VIDEO tracks play their audio through SDL's own audio device
+//       (WASAPI, ~400ms queue - ffplay's anti-chop trick): the XMPlay mixer
+//       is a thin buffer and any DPC/scheduler jitter on this machine drains
+//       it and chops; audio-only tracks keep the mixer (always smooth)
+//   1 = always the XMPlay mixer (legacy behavior)
+//   2 = always SDL audio device
+// Note: in SDL mode XMPlay's volume slider does not reach the SDL device.
+static int g_audiort = 0;
+
 struct FFMPEG {
 	XMPFILE file;
 	AVFormatContext *fmt;
@@ -949,7 +959,7 @@ static BOOL sdl_ensure_tex(int w, int h)
 	if (sdl_tex) { SDL_DestroyTexture(sdl_tex); sdl_tex = 0; }
 	// the DIB is BGRA in memory; SDL_PIXELFORMAT_BGRA8888 matches byte order
 	if (SDL_CreateTexture(sdl_ren, SDL_PIXELFORMAT_BGRA8888,
-		SDL_TEXTUREACCESS_STREAMING, w, h) != 0) {
+		SDL_TEXTUREACCESS_STREAMING, w, h) == NULL) {
 		logmsg("dv: SDL_CreateTexture failed: %s", SDL_GetError());
 		return FALSE;
 	}
@@ -997,6 +1007,108 @@ static void sdl_fullscreen_toggle(void)
 	logmsg("dv: SDL fullscreen -> %s",
 		(SDL_GetWindowFlags(sdl_win) & SDL_WINDOW_FULLSCREEN)
 			? "exclusive" : "windowed/desktop");
+}
+
+// ------------------------------------------------------------------ SDL audio
+// ffplay does not chop on this kind of machine because its audio goes through
+// SDL's audio driver with a 100-300ms buffer that absorbs DPC/scheduler
+// jitter. XMPlay's mixer buffer is thin and sits just downstream of the
+// jitter source - the plugin cannot reach it. So for video tracks we play the
+// audio through our OWN WASAPI device (inside the statically linked SDL2,
+// still one DLL): the queue API keeps ~400ms of audio ahead of real time, and
+// the mixer gets silence (Process returns 0).
+static SDL_AudioDeviceID sa_dev = 0;
+static int sa_rate = 0;          // negotiated device rate (Hz)
+static int sa_ch = 2;
+static int sa_bps = 0;          // bytes/sec of the queued s16 stream
+static volatile long long sa_total = 0; // bytes queued since open/seek
+static double sa_base = 0;      // content time of the first queued byte
+static int sa_target = 0;       // jitter-buffer depth, bytes
+static SwrContext *sa_swr = 0;  // flt(dec rate/ch) -> s16(sa_rate, 2ch)
+static unsigned long sa_ur = 0;  // underrun count (queue emptied while playing)
+
+// content time being heard right now: everything queued minus what still sits
+// in the device queue
+static double sa_now(void)
+{
+	if (!sa_dev || !sa_bps) return -1;
+	double cons = (double)sa_total - (double)SDL_GetQueuedAudioSize(sa_dev);
+	if (cons < 0) cons = 0;
+	return sa_base + cons / sa_bps;
+}
+
+static int sa_open(FFMPEG *f)
+{
+	if (sa_dev) return 1;
+	// WASAPI shared accepts these rates; anything else resamples to 48k
+	int devrate = 48000;
+	static const int ok[] = { 8000,11025,16000,22050,32000,44100,48000,88200,96000 };
+	for (int i = 0; i < (int)(sizeof ok / sizeof ok[0]); i++)
+		if (f->dec->sample_rate == ok[i]) { devrate = ok[i]; break; }
+	SDL_AudioSpec want;
+	memset(&want, 0, sizeof want);
+	want.freq = devrate; want.format = AUDIO_S16LSB;
+	want.channels = 2; want.samples = 4096;
+	sa_dev = SDL_OpenAudioDevice(0, 0, &want, 4096, 0, 0);
+	if (!sa_dev) {
+		logmsg("dv: SDL audio open failed: %s", SDL_GetError());
+		return 0;
+	}
+	SDL_AudioSpec have;
+	if (SDL_GetAudioDeviceSpec(sa_dev, &have) == 0) {
+		sa_rate = have.freq; sa_ch = have.channels;
+	} else {
+		sa_rate = want.freq; sa_ch = want.channels;
+	}
+	if (sa_ch > 2) sa_ch = 2;
+	sa_bps = sa_rate * sa_ch * 2;
+	sa_target = (int)((double)sa_bps * 0.4 + 0.5); // 400ms of lead
+	if (sa_target > 110 * 1024) sa_target = 110 * 1024; // SDL's queue cap is 128KB
+	sa_total = 0; sa_base = 0; sa_ur = 0;
+	AVChannelLayout cin, cout;
+	av_channel_layout_from_count(&cin, f->dec->ch_layout.nb_channels);
+	av_channel_layout_from_count(&cout, 2);
+	if (swr_alloc_set_opts2(&sa_swr, &cout, AV_SAMPLE_FMT_S16, sa_rate,
+		&cin, AV_SAMPLE_FMT_FLT, f->dec->sample_rate, 0, NULL) < 0 ||
+		swr_init(sa_swr) < 0) {
+		logmsg("dv: SDL audio swr alloc failed");
+		swr_free(&sa_swr);
+		SDL_CloseAudioDevice(sa_dev); sa_dev = 0;
+		return 0;
+	}
+	logmsg("dv: SDL audio open: %dHz %dch s16 target %.0fms",
+		sa_rate, sa_ch, (double)sa_target * 1000.0 / sa_bps);
+	return 1;
+}
+
+static void sa_close(void)
+{
+	if (sa_dev) { SDL_CloseAudioDevice(sa_dev); sa_dev = 0; }
+	if (sa_swr) { swr_free(&sa_swr); sa_swr = 0; }
+}
+
+// one decoded chunk in f->outbuf (flt, dec rate/ch, `gotframes` frames) ->
+// resample to the device format and queue it
+static void sa_feed(FFMPEG *f, DWORD gotframes)
+{
+	if (!sa_dev || !sa_swr || !gotframes) return;
+	static uint8_t *sabuf = 0;
+	static int sacap = 0;
+	int maxo = (int)(gotframes * ((double)sa_rate / f->dec->sample_rate) + 8);
+	if (maxo * sa_ch * 2 > sacap) {
+		free(sabuf); sabuf = 0;
+		sabuf = (uint8_t*)malloc((size_t)maxo * sa_ch * 2 + 1024);
+		sacap = sabuf ? maxo * sa_ch * 2 + 1024 : 0;
+		if (!sabuf) return;
+	}
+	uint8_t *dst = sabuf;
+	int n = swr_convert(sa_swr, &dst, maxo, (const uint8_t*)f->outbuf,
+		(int)gotframes);
+	if (n > 0) {
+		SDL_QueueAudio(sa_dev, sabuf, n * sa_ch * 2);
+		sa_total += (long long)n * sa_ch * 2;
+		f->pos += (double)n / sa_rate; // content time handed to the device
+	}
 }
 
 
@@ -2927,11 +3039,14 @@ static DWORD WINAPI FF_Open(const char *filename, XMPFILE file)
 	if (current->netfile)
 		xmpffile->NetSetRate(file, current->bitrate ? current->bitrate * 125 : 32000);
 	// read the bisection switch each open so it can be flipped without a rebuild
-	{ int vm = 0;
+	{ int vm = 0, ar = 0;
 	  if (xmpfreg && xmpfreg->GetInt(LRC_REGSEC, "VideoMode", &vm))
 		  g_video_mode = (vm >= 0 && vm <= 7) ? vm : 0;
 	  else g_video_mode = 0;
-	  logmsg("cb: VideoMode=%d", g_video_mode); }
+	  if (xmpfreg && xmpfreg->GetInt(LRC_REGSEC, "AudioRoute", &ar))
+		  g_audiort = (ar >= 0 && ar <= 2) ? ar : 0;
+	  else g_audiort = 0;
+	  logmsg("cb: VideoMode=%d AudioRoute=%d", g_video_mode, g_audiort); }
 	if (g_video_mode != 2)
 		video_attach(current); // attach the vis video iff this file has a video stream
 	if (current->vstream < 0 || g_video_mode == 2) {
@@ -3002,6 +3117,7 @@ static DWORD WINAPI FF_Open(const char *filename, XMPFILE file)
 static void WINAPI FF_Close()
 {
 	logmsg("cb: Close");
+	sa_close(); // SDL audio device, if this track used it
 	video_detach(); // stop the render thread before freeing the video decoder
 	lyric_invalidate(); // drop this track's lyrics + any in-flight fetch result
 	EnterCriticalSection(&demux_lock);
@@ -3030,6 +3146,17 @@ static void WINAPI FF_SetFormat(XMPFORMAT *form)
 	form->chan = f->dec->ch_layout.nb_channels;
 	form->res = res_code(f->dec->sample_fmt, f->dec->bits_per_raw_sample);
 	form->chanmask = (f->dec->ch_layout.order == AV_CHANNEL_ORDER_NATIVE) ? (WORD)f->dec->ch_layout.u.mask : 0;
+	// audio routing: a track with a live video decode thread plays through the
+	// SDL device (thick queue absorbs jitter); audio-only stays on the mixer
+	{
+		int hasvid = (f->vstream >= 0 && g_video_mode != 1 && g_video_mode != 2);
+		int want_sa = (g_audiort == 2) || (g_audiort == 0 && hasvid);
+		sa_close(); // a new track may decode at a different rate
+		if (want_sa && sa_open(f))
+			logmsg("cb: SetFormat -> SDL audio (mixer silenced)");
+		else
+			logmsg("cb: SetFormat -> mixer");
+	}
 }
 
 static void WINAPI FF_GetInfoText(char *format, char *length)
@@ -3110,6 +3237,85 @@ static void video_late_scan(FFMPEG *f)
 	}
 }
 
+// decode one resampled chunk into f->outbuf: pull frames from the audio
+// decoder, feeding it held-back packets / fresh demuxer reads as needed.
+// Returns 1 when a chunk (or progress) was made, 0 to stop the caller's
+// loop (EOF, or the decoder input is still full - return what we have).
+// Caller holds demux_lock.
+static int decode_one(FFMPEG *f)
+{
+	int ch = f->dec->ch_layout.nb_channels;
+	if (ch < 1) ch = 1;
+	int ret = avcodec_receive_frame(f->dec, f->frame);
+	if (ret == 0) { // got a frame -> resample to interleaved float
+		int maxn = swr_get_out_samples(f->swr, f->frame->nb_samples);
+		if (maxn < 1) maxn = f->frame->nb_samples + 256;
+		if (!ensure_outbuf(f, (DWORD)maxn * ch)) { f->eof = TRUE; return 0; }
+		uint8_t *dst = (uint8_t*)f->outbuf;
+		int got = swr_convert(f->swr, &dst, maxn,
+			(const uint8_t**)f->frame->extended_data, f->frame->nb_samples);
+		if (got < 0) got = 0;
+		f->outlen = (DWORD)got * ch;
+		f->outp = 0;
+		return 1;
+	}
+	if (ret == AVERROR_EOF || (ret < 0 && ret != AVERROR(EAGAIN))) {
+		f->eof = TRUE; // drained or decode error
+		return 0;
+	}
+	// decoder needs more input
+	if (f->sent_eof) { f->eof = TRUE; return 0; }
+	// drain audio packets held back by a full decoder input, in order,
+	// ahead of any demuxer reads (keeps audio packet order intact)
+	if (f->pend_n > 0) {
+		AVPacket *pa = f->pend_a[0];
+		int pr = avcodec_send_packet(f->dec, pa);
+		if (pr == 0) {
+			for (int i = 1; i < f->pend_n; i++) f->pend_a[i - 1] = f->pend_a[i];
+			f->pend_n--;
+			av_packet_free(&pa);
+			return 1; // that frame can come out of the decoder now
+		}
+		return 0; // still full: return what we have; XMPlay calls again
+	}
+	ret = av_read_frame(f->fmt, f->pkt);
+	if (ret >= 0) {
+		if (f->pkt->stream_index == f->vstream && video.active) {
+			// hand the video packet to the render thread
+			AVPacket *vp = av_packet_alloc();
+			if (vp) { av_packet_move_ref(vp, f->pkt); video_enqueue(vp); }
+			else av_packet_unref(f->pkt);
+			return 1;
+		}
+		if (f->pkt->stream_index != f->stream) {
+			av_packet_unref(f->pkt); // other streams - skip
+			return 1;
+		}
+		{ int sr = avcodec_send_packet(f->dec, f->pkt);
+		  if (sr == AVERROR(EAGAIN)) {
+			  // decoder input full: hold the packet - the OLD unconditional
+			  // unref here lost audio whenever this fired
+			  AVPacket *keep = av_packet_alloc();
+			  if (keep) {
+				  av_packet_move_ref(keep, f->pkt);
+				  if (f->pend_n < 8) f->pend_a[f->pend_n++] = keep; else av_packet_free(&keep);
+			  } else av_packet_unref(f->pkt);
+			  return 1;
+		  }
+		  av_packet_unref(f->pkt); // decoder took its own ref (or send failed)
+		}
+		return 1;
+	}
+	if (ret == AVERROR(EAGAIN)) return 1; // still downloading: retry on a later call
+	f->sent_eof = TRUE;
+	f->demux_eof = TRUE;
+	EnterCriticalSection(&video.lock);
+	video.demux_eof_seen = TRUE;
+	LeaveCriticalSection(&video.lock);
+	avcodec_send_packet(f->dec, NULL); // end of input: drain the decoder
+	return 1;
+}
+
 static DWORD WINAPI FF_Process(float *buffer, DWORD count)
 {
 	FFMPEG *f = current;
@@ -3122,8 +3328,13 @@ static DWORD WINAPI FF_Process(float *buffer, DWORD count)
 	// a seek when the buffer drains and refills) - driving the picture off
 	// f->pos makes the video rush ahead of the audio and stutter.
 	// Captured unconditionally now: audio-only tracks need the same clock to
-	// drive the LRC lyrics display.
-	video_clock_capture(xmpfstatus ? xmpfstatus->GetTime() : f->pos);
+	// drive the LRC lyrics display. With SDL audio the mixer's clock is
+	// irrelevant (it plays silence) - drive the picture off our OWN device's
+	// consumed-time instead, so video stays locked to the heard audio.
+	if (sa_dev)
+		video_clock_capture(sa_now());
+	else
+		video_clock_capture(xmpfstatus ? xmpfstatus->GetTime() : f->pos);
 	{ // demand + clock heartbeat, 10/sec
 		static DWORD lastbeat;
 		DWORD now = GetTickCount();
@@ -3137,6 +3348,10 @@ static DWORD WINAPI FF_Process(float *buffer, DWORD count)
 	DWORD done = 0;
 	int ch = f->dec->ch_layout.nb_channels;
 	if (ch < 1) ch = 1;
+	if (sa_dev) { // the device queue keeps the player's pause state in sync
+		SDL_PauseAudioDevice(sa_dev,
+			xmpfstatus && !xmpfstatus->IsPlaying() ? 1 : 0);
+	}
 
 	// deferred seek fast-forward (set by FF_SetPosition): skip packets up to
 	// the seek target so audio + video start AT the target, not at the (often
@@ -3181,6 +3396,26 @@ static DWORD WINAPI FF_Process(float *buffer, DWORD count)
 		}
 	}
 
+	if (sa_dev) {
+		// SDL audio: keep the device queue at sa_target bytes (the jitter
+		// buffer). Each Process call tops it up by decoding 218ms-ish chunks;
+		// in steady state the condition is false and the call is cheap. The
+		// mixer below gets 0 samples - the audio we hear lives in this queue.
+		if (!f->eof && !f->sent_eof) {
+			int guard = 0;
+			while (!f->eof && !f->sent_eof && guard++ < 40 &&
+				(double)SDL_GetQueuedAudioSize(sa_dev) < (double)sa_target) {
+				if (f->outp < f->outlen) { // a chunk is staged: feed it
+					sa_feed(f, f->outlen / ch);
+					if (SDL_GetQueuedAudioSize(sa_dev) == 0 && sa_total > 0)
+						sa_ur++; // queue drained below the audible head
+					f->outp = f->outlen;
+					continue;
+				}
+				if (decode_one(f) == 0) break; // stall: retry on the next call
+			}
+		}
+	} else {
 	while (done < count) {
 		if (f->outp < f->outlen) { // staged samples available
 			DWORD n = count - done;
@@ -3192,74 +3427,8 @@ static DWORD WINAPI FF_Process(float *buffer, DWORD count)
 			continue;
 		}
 		if (f->eof) break;
-
-		int ret = avcodec_receive_frame(f->dec, f->frame);
-		if (ret == 0) { // got a frame -> resample to interleaved float
-			int maxn = swr_get_out_samples(f->swr, f->frame->nb_samples);
-			if (maxn < 1) maxn = f->frame->nb_samples + 256;
-			if (!ensure_outbuf(f, (DWORD)maxn * ch)) { f->eof = TRUE; break; }
-			uint8_t *dst = (uint8_t*)f->outbuf;
-			int got = swr_convert(f->swr, &dst, maxn,
-				(const uint8_t**)f->frame->extended_data, f->frame->nb_samples);
-			if (got < 0) got = 0;
-			f->outlen = (DWORD)got * ch;
-			f->outp = 0;
-			continue;
-		}
-		if (ret == AVERROR_EOF || (ret < 0 && ret != AVERROR(EAGAIN))) {
-			f->eof = TRUE; // drained or decode error
-			break;
-		}
-		// decoder needs more input
-		if (f->sent_eof) { f->eof = TRUE; break; }
-		// drain audio packets held back by a full decoder input, in order,
-		// ahead of any demuxer reads (keeps audio packet order intact)
-		if (f->pend_n > 0) {
-			AVPacket *pa = f->pend_a[0];
-			int pr = avcodec_send_packet(f->dec, pa);
-			if (pr == 0) {
-				for (int i = 1; i < f->pend_n; i++) f->pend_a[i - 1] = f->pend_a[i];
-				f->pend_n--;
-				av_packet_free(&pa);
-				continue; // that frame can come out of the decoder now
-			}
-			break; // still full: return what we have; XMPlay calls again
-		}
-		ret = av_read_frame(f->fmt, f->pkt);
-		if (ret >= 0) {
-			if (f->pkt->stream_index == f->vstream && video.active) {
-				// hand the video packet to the render thread
-				AVPacket *vp = av_packet_alloc();
-				if (vp) { av_packet_move_ref(vp, f->pkt); video_enqueue(vp); }
-				else av_packet_unref(f->pkt);
-				continue;
-			}
-			if (f->pkt->stream_index != f->stream) {
-				av_packet_unref(f->pkt); // other streams - skip
-				continue;
-			}
-			{ int sr = avcodec_send_packet(f->dec, f->pkt);
-			  if (sr == AVERROR(EAGAIN)) {
-				  // decoder input full: hold the packet - the OLD unconditional
-				  // unref here lost audio whenever this fired
-				  AVPacket *keep = av_packet_alloc();
-				  if (keep) {
-					  av_packet_move_ref(keep, f->pkt);
-					  if (f->pend_n < 8) f->pend_a[f->pend_n++] = keep; else av_packet_free(&keep);
-				  } else av_packet_unref(f->pkt);
-				  continue;
-			  }
-			  av_packet_unref(f->pkt); // decoder took its own ref (or send failed)
-			}
-			continue;
-		}
-		if (ret == AVERROR(EAGAIN)) continue;
-		f->sent_eof = TRUE;
-		f->demux_eof = TRUE;
-		EnterCriticalSection(&video.lock);
-		video.demux_eof_seen = TRUE;
-		LeaveCriticalSection(&video.lock);
-		avcodec_send_packet(f->dec, NULL); // end of input: drain the decoder
+		if (decode_one(f) == 0) break;
+	}
 	}
 
 	// top the video queue up to VQ_TARGET. The demand loop above only reads
@@ -3321,7 +3490,7 @@ static DWORD WINAPI FF_Process(float *buffer, DWORD count)
 			(f->dec->sample_rate ? f->dec->sample_rate : 44100));
 		DWORD tot = now - c0;
 		if (tot > pb_worst) pb_worst = tot;
-		if (done < count) pb_ur++;
+		if (!sa_dev && done < count) pb_ur++;
 		if (now - pb_last >= 200) {
 			logmsg("pb: gap=%lu exp=%lu tot=%lu ur=%lu fpos=%.2f",
 				(unsigned long)gap, (unsigned long)exp,
@@ -3331,7 +3500,20 @@ static DWORD WINAPI FF_Process(float *buffer, DWORD count)
 			pb_ur = 0;
 		}
 	}
-	return done;
+	if (sa_dev) {
+		// SDL-audio diagnostics: queue depth + consumed-time + underruns.
+		// q should hover near the target; q=0 with ur climbing is a stall.
+		static DWORD sa_last = 0;
+		DWORD now = GetTickCount();
+		if (now - sa_last >= 500) {
+			sa_last = now;
+			logmsg("sa: q=%.0fms now=%.2f base=%.2f tgt=%.0fms ur=%lu",
+				(double)SDL_GetQueuedAudioSize(sa_dev) * 1000.0 / sa_bps,
+				sa_now(), sa_base, (double)sa_target * 1000.0 / sa_bps,
+				(unsigned long)sa_ur);
+		}
+	}
+	return sa_dev ? 0 : done;
 }
 
 static double WINAPI FF_GetGranularity()
@@ -3373,11 +3555,16 @@ static double WINAPI FF_SetPosition(DWORD pos)
 
 	avcodec_flush_buffers(f->dec);
 	swr_init(f->swr); // drop any resampler delay
+	if (sa_swr) swr_init(sa_swr);
 	f->outlen = f->outp = 0;
 	f->eof = f->sent_eof = FALSE;
 	f->demux_eof = FALSE;
 	for (int i = 0; i < 8; i++) if (f->pend_a[i]) av_packet_free(&f->pend_a[i]); // pre-seek packets are stale
 	f->pend_n = 0;
+	if (sa_dev) { // drop the pre-seek queue; the next Process call re-fills it
+		SDL_ClearQueuedAudio(sa_dev);
+		sa_total = 0; sa_base = t;
+	}
 
 	// Clear the stale video queue + flush the video decoder (safe under
 	// demux_lock: video_flush only takes video.lock, the established order).
