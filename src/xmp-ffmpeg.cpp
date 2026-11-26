@@ -955,8 +955,8 @@ static void d3d_present(void)
 		for (int i = 0; i < 8; i++) {
 			RECT rc;
 			GetClientRect(video.hwnd, &rc);
-			d3pp.wBackBufferWidth = (UINT)(rc.right - rc.left);
-			d3pp.wBackBufferHeight = (UINT)(rc.bottom - rc.top);
+			d3pp.BackBufferWidth = (UINT)(rc.right - rc.left);
+			d3pp.BackBufferHeight = (UINT)(rc.bottom - rc.top);
 			if (d3dev->Reset(&d3pp) == D3D_OK) { ok = TRUE; break; }
 			Sleep(5);
 		}
@@ -966,7 +966,7 @@ static void d3d_present(void)
 			if (now - s_lost_log >= 1000) {
 				s_lost_log = now;
 				logmsg("dv: D3D device lost, Reset failing (win=%ux%u tex=%dx%d)",
-					d3pp.wBackBufferWidth, d3pp.wBackBufferHeight, d3tex_w, d3tex_h);
+					d3pp.BackBufferWidth, d3pp.BackBufferHeight, d3tex_w, d3tex_h);
 			}
 			return;
 		}
@@ -1052,7 +1052,7 @@ static void d3d_present(void)
 	} else if (!s_dv_first) {
 		s_dv_first = 1;
 		logmsg("dv: first D3D present ok back=%ux%u tex=%dx%d",
-			d3pp.wBackBufferWidth, d3pp.wBackBufferHeight, d3tex_w, d3tex_h);
+			d3pp.BackBufferWidth, d3pp.BackBufferHeight, d3tex_w, d3tex_h);
 	}
 }
 
