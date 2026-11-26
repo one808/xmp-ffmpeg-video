@@ -645,6 +645,21 @@ static void video_render_frame()
 	video.have_new = TRUE; // a fresh frame is waiting for FF_VisRenderDC
 }
 
+// present/paint latency stats, written by the window thread, reported (and
+// reset) by the decode thread's vt: heartbeat: pr= count, prw= worst us.
+static LARGE_INTEGER g_prqf;
+static volatile long g_pr_worst_us;
+static volatile long g_pr_count;
+static void pr_stat(LARGE_INTEGER p0, LARGE_INTEGER p1)
+{
+	g_pr_count++;
+	if (g_prqf.QuadPart) {
+		long us = (long)((double)(p1.QuadPart - p0.QuadPart) * 1000000.0
+			/ (double)g_prqf.QuadPart);
+		if (us > g_pr_worst_us) g_pr_worst_us = us;
+	}
+}
+
 // decode the frame(s) due at the playback position into video.dib.
 // BOUNDED work per call: without a budget, a broken-timestamp stream (all
 // frames "late") makes this loop decode forever - 100% CPU spin, starved audio.
@@ -867,20 +882,6 @@ static IDirect3DDevice9 *d3dev = 0;
 static IDirect3DTexture9 *d3tex = 0;
 static int d3tex_w = 0, d3tex_h = 0;
 static D3DPRESENT_PARAMETERS d3pp;
-// present/paint latency stats, written by the window thread, reported (and
-// reset) by the decode thread's vt: heartbeat: pr= count, prw= worst us.
-static LARGE_INTEGER g_prqf;
-static volatile long g_pr_worst_us;
-static volatile long g_pr_count;
-static void pr_stat(LARGE_INTEGER p0, LARGE_INTEGER p1)
-{
-	g_pr_count++;
-	if (g_prqf.QuadPart) {
-		long us = (long)((double)(p1.QuadPart - p0.QuadPart) * 1000000.0
-			/ (double)g_prqf.QuadPart);
-		if (us > g_pr_worst_us) g_pr_worst_us = us;
-	}
-}
 
 static void d3d_release(void)
 {
@@ -950,7 +951,7 @@ static void d3d_present(void)
 
 	{ // copy the DIB into the texture (row by row; the pitch may differ)
 		D3DLOCKED_RECT lr;
-		if (d3tex->LockRect(0, &lr, 0, D3DLOCK_NO_WAIT) != D3D_OK) return;
+		if (d3tex->LockRect(0, &lr, 0, D3DLOCK_DONOTWAIT) != D3D_OK) return;
 		int w = video.dibw, h = video.dibh;
 		const BYTE *src = video.dib;
 		BYTE *dst = (BYTE*)lr.pBits;
@@ -977,7 +978,10 @@ static void d3d_present(void)
 	float B = (float)(1.0 - 2.0 * (vy + vh) / ch);
 
 	IDirect3DSurface9 *bb = 0;
-	if (d3dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_DEFAULT, &bb) != D3D_OK) return;
+	// the legacy d3d9.h lacks D3DBACKBUFFER_TYPE_DEFAULT / the D3DTS_/D3DTOP_/
+	// D3DTEXF_ enums: use the raw values (D3DBACKBUFFER_TYPE_BACK=1,
+	// D3DTS_TEXTUREOP=0/D3DTS_TFACTORY=1, D3DTOP_SELECTARG=1, D3DTEXF_TEXTURE=0)
+	if (d3dev->GetBackBuffer(0, 0, 1 /*BACK*/, &bb) != D3D_OK) return;
 	d3dev->SetRenderTarget(0, bb);
 	{
 		D3DVIEWPORT9 vp = { 0, 0, (UINT)cw, (UINT)ch, 0.0f, 1.0f };
@@ -986,9 +990,11 @@ static void d3d_present(void)
 	d3dev->BeginScene();
 	d3dev->Clear(0, 0, D3DCLEAR_TARGET, 0xFF000000, -1.0f, 0);
 	d3dev->SetTexture(0, d3tex);
-	d3dev->SetTextureStageState(0, D3DTG_TEXTUREOP, D3DTEXTUREOP_SELECTARG);
-	d3dev->SetTextureStageState(0, D3DTG_TFACTORY, D3DTEXF_TEXTURE);
-	d3dev->SetFVF(D3DFVF_XYZRHW1 | D3DFVF_TEX1);
+	d3dev->SetTextureStageState(0, 0 /*D3DTS_TEXTUREOP*/, 1 /*D3DTOP_SELECTARG*/);
+	d3dev->SetTextureStageState(0, 1 /*D3DTS_TFACTORY*/, 0 /*D3DTEXF_TEXTURE*/);
+	// legacy header lacks D3DFVF_XYZRHW1: it is D3DFVF_XYZRHW plus a 32-bit
+	// render-height flag
+	d3dev->SetFVF(D3DFVF_XYZRHW | 0x20 /*32-bit RH*/);
 	{
 		struct V { float x, y, z, rh; float u, v; };
 		V q[4] = {
