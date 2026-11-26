@@ -882,6 +882,7 @@ static IDirect3DDevice9 *d3dev = 0;
 static IDirect3DTexture9 *d3tex = 0;
 static int d3tex_w = 0, d3tex_h = 0;
 static D3DPRESENT_PARAMETERS d3pp;
+static volatile int s_dv_first = 0; // first successful D3D present (one-time log)
 
 static void d3d_release(void)
 {
@@ -941,17 +942,50 @@ static void d3d_present(void)
 	if (!d3dev || !video.dib || video.dibw < 1 || !video.dibh) return;
 
 	// a display / resolution change loses the device: reset it (the texture
-	// dies with the device and is recreated on demand)
+	// dies with the device and is recreated on demand). The driver also
+	// auto-loses the device when the window is resized (VSHOW sizes the
+	// window to the native video size) - and it may still be busy, so a
+	// single Reset attempt often fails. A FAILED reset leaves the device
+	// LOST and every subsequent present becomes a no-op: the window then
+	// shows no pixels at all (it looks "transparent"). Retry with short
+	// waits instead of giving up for the whole stream.
 	HRESULT tl = d3dev->TestCooperativeLevel();
 	if (tl == D3DERR_DEVICELOST || tl == D3DERR_DEVICENOTRESET) {
-		if (d3dev->Reset(&d3pp) != D3D_OK) return;
+		BOOL ok = FALSE;
+		for (int i = 0; i < 8; i++) {
+			RECT rc;
+			GetClientRect(video.hwnd, &rc);
+			d3pp.wBackBufferWidth = (UINT)(rc.right - rc.left);
+			d3pp.wBackBufferHeight = (UINT)(rc.bottom - rc.top);
+			if (d3dev->Reset(&d3pp) == D3D_OK) { ok = TRUE; break; }
+			Sleep(5);
+		}
+		if (!ok) {
+			static DWORD s_lost_log = 0;
+			DWORD now = GetTickCount();
+			if (now - s_lost_log >= 1000) {
+				s_lost_log = now;
+				logmsg("dv: D3D device lost, Reset failing (win=%ux%u tex=%dx%d)",
+					d3pp.wBackBufferWidth, d3pp.wBackBufferHeight, d3tex_w, d3tex_h);
+			}
+			return;
+		}
 		if (d3tex) { d3tex->Release(); d3tex = 0; }
 	}
 	if (!d3d_ensure_tex(video.dibw, video.dibh)) return;
 
 	{ // copy the DIB into the texture (row by row; the pitch may differ)
 		D3DLOCKED_RECT lr;
-		if (d3tex->LockRect(0, &lr, 0, D3DLOCK_DONOTWAIT) != D3D_OK) return;
+		HRESULT lh = d3tex->LockRect(0, &lr, 0, D3DLOCK_DONOTWAIT);
+		if (lh != D3D_OK) {
+			static DWORD s_lock_log = 0;
+			DWORD now = GetTickCount();
+			if (now - s_lock_log >= 1000) {
+				s_lock_log = now;
+				logmsg("dv: LockRect failing hr=0x%08X", (unsigned)lh);
+			}
+			return;
+		}
 		int w = video.dibw, h = video.dibh;
 		const BYTE *src = video.dib;
 		BYTE *dst = (BYTE*)lr.pBits;
@@ -1006,8 +1040,20 @@ static void d3d_present(void)
 		d3dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, q, sizeof(V));
 	}
 	d3dev->EndScene();
-	d3dev->Present(0, 0, 0, 0);
+	HRESULT ph = d3dev->Present(0, 0, 0, 0);
 	if (bb) bb->Release();
+	if (ph != D3D_OK) {
+		static DWORD s_pres_log = 0;
+		DWORD now = GetTickCount();
+		if (now - s_pres_log >= 1000) {
+			s_pres_log = now;
+			logmsg("dv: Present failing hr=0x%08X", (unsigned)ph);
+		}
+	} else if (!s_dv_first) {
+		s_dv_first = 1;
+		logmsg("dv: first D3D present ok back=%ux%u tex=%dx%d",
+			d3pp.wBackBufferWidth, d3pp.wBackBufferHeight, d3tex_w, d3tex_h);
+	}
 }
 
 // find XMPlay's main top-level window (the video window's owner so it follows
