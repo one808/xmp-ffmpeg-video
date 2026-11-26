@@ -935,6 +935,8 @@ static HWND sdl_native(void)
 {
 	if (!sdl_win) return 0;
 	SDL_SysWMinfo si;
+	memset(&si, 0, sizeof si);
+	si.version = SDL_SYSWMINFO_VERSION; // required, else SDL_GetWindowWMInfo fails
 	if (SDL_GetWindowWMInfo(sdl_win, &si) == SDL_TRUE)
 		return si.info.win.window;
 	return 0;
@@ -1578,7 +1580,10 @@ static DWORD WINAPI video_wnd_thread(LPVOID)
 		// GDI-only (mode 6) skips GPU entirely; otherwise try SDL first
 		if (sdl_setup(640, 480)) {
 			HWND h = sdl_native();
-			if (!h) { sdl_release(); }
+			if (!h) {
+				logmsg("dv: SDL_GetWindowWMInfo failed -> native window fallback");
+				sdl_release();
+			}
 			else {
 				video.hwnd = h;
 				g_sdl_orig_proc = (WNDPROC)GetWindowLongPtr(h, GWLP_WNDPROC);
