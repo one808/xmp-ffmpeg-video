@@ -936,7 +936,7 @@ static HWND sdl_native(void)
 	if (!sdl_win) return 0;
 	SDL_SysWMinfo si;
 	memset(&si, 0, sizeof si);
-	si.version = SDL_SYSWMINFO_VERSION; // required, else SDL_GetWindowWMInfo fails
+	SDL_VERSION(&si.version); // required, else SDL_GetWindowWMInfo fails
 	if (SDL_GetWindowWMInfo(sdl_win, &si) == SDL_TRUE)
 		return si.info.win.window;
 	return 0;
