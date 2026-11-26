@@ -1064,7 +1064,11 @@ static int sa_open(FFMPEG *f)
 	SDL_AudioSpec want;
 	memset(&want, 0, sizeof want);
 	want.freq = devrate; want.format = AUDIO_S16LSB;
-	want.channels = 2; want.samples = 4096;
+	want.channels = 2; want.samples = 16384; // the ENGINE buffer: ~340ms @48k.
+	                                       // The engine's own small buffer is
+	                                       // what DPC stalls punch through - the
+	                                       // queue cannot save it. Bigger engine
+	                                       // buffer = bigger jitter margin.
 	// allowed_changes=0: SDL converts hardware differences internally and the
 	// queued format stays exactly `want`
 	sa_dev = SDL_OpenAudioDevice(0, 0, &want, &want, 0);
@@ -1074,8 +1078,9 @@ static int sa_open(FFMPEG *f)
 	}
 	sa_rate = want.freq; sa_ch = 2;
 	sa_bps = sa_rate * sa_ch * 2;
-	sa_target = (int)((double)sa_bps * 1.0 + 0.5); // 1s of lead: survives the
-	                                               // long DPC stalls on this box
+	sa_target = (int)((double)sa_bps * 0.3 + 0.5); // 300ms feed head; the ENGINE
+	                                               // buffer (16k frames ~340ms)
+	                                               // absorbs DPC stalls on top
 	if (sa_target > 480 * 1024) sa_target = 480 * 1024;
 	sa_total = 0; sa_base = 0; sa_ur = 0;
 	AVChannelLayout cin, cout;
