@@ -1163,7 +1163,7 @@ static BOOL video_fullscreen_exclusive_on()
 	fspp.BackBufferFormat = D3DFMT_X8R8G8B8;
 	fspp.BackBufferWidth = (UINT)GetSystemMetrics(SM_CXSCREEN);
 	fspp.BackBufferHeight = (UINT)GetSystemMetrics(SM_CYSCREEN);
-	fspp.FullScreen_RefreshRateInHertz = 0; // keep the display's current mode
+	fspp.FullScreen_RefreshRateInHz = 0; // keep the display's current mode
 	if (d3tex) { d3tex->Release(); d3tex = 0; } // dies with the reset
 	if (d3dev->Reset(&fspp) != D3D_OK) {
 		d3dev->Reset(&d3pp); // back to windowed
