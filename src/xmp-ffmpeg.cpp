@@ -56,6 +56,14 @@ static XMPFUNC_REGISTRY *xmpfreg;
 static DWORD xmpver;
 static HINSTANCE dllinst;           // our DLL instance (vis config dialog resource)
 static DWORD vis_colors[3];        // skin colors from FF_VisOpen (bg,text1,text2)
+// the plugin's own borderless video window: the picture renders HERE on the
+// plugin's own window thread, decoupled from XMPlay's audio/UI so the GDI
+// blit can't choke the audio. All window ops are posted (never cross-thread
+// SendMessage) so they run on the window thread's own message loop.
+#define WM_APP_VSHOW   (WM_APP + 1) // show + dock to XMPlay (audio thread -> window)
+#define WM_APP_VHIDE   (WM_APP + 2) // hide (stop / switch)
+#define WM_APP_VBLANK  (WM_APP + 3) // clear the picture to black
+#define WM_APP_VPRESENT (WM_APP + 4) // a fresh frame is in the DIB: repaint
 // bisection switch ("FFmpeg video"/VideoMode in XMPlay's registry face):
 //   0 = full video (default)  1 = video attached but NO decode thread
 //   2 = play as audio-only (no video attach; LRC lyrics show instead)
@@ -149,6 +157,22 @@ struct VIDEO {
 	int dibw, dibh;
 	volatile BOOL vis_open;     // vis area open (FF_VisOpen / FF_VisClose)
 	int sws_tw, sws_th;         // sws TARGET (DIB) size - capped for CPU, not full res
+	// independent borderless video window (the picture lives here, not in the
+	// XMPlay vis area - so the GDI blit is off XMPlay's threads)
+	HWND hwnd;                  // the video window (created on the window thread)
+	HANDLE wnd_thread;          // the window thread (owns hwnd + the message loop)
+	DWORD wnd_threadid;
+	volatile BOOL win_visible;  // window shown: the decode thread only works when this
+	HDC memdc;                  // double-buffered paint (window thread only)
+	HBITMAP membmp;
+	HGDIOBJ memold;
+	int memw, memh;
+	BOOL fullscreen;
+	WINDOWPLACEMENT saved;
+	BOOL saved_valid;
+	volatile BOOL hidden;       // user hid it (ESC) - decode idles
+	int show_w, show_h;         // default window size (native video, clamped)
+	BOOL size_set;              // default size applied once, never fought afterwards
 	// playback clock: captured on XMPlay's thread, interpolated here. The
 	// render thread must NEVER call XMPlay functions (deadlock risk).
 	double clock_base;
@@ -718,6 +742,8 @@ static void video_tick()
 		LeaveCriticalSection(&video.lock);
 		break; // one present per tick is enough
 	}
+	if (shown_pts > 0 && video.hwnd)
+		PostMessage(video.hwnd, WM_APP_VPRESENT, 0, 0); // repaint on the window thread
 	{ // per-tick CPU: how long this tick's decode+scale took
 		LARGE_INTEGER q1; QueryPerformanceCounter(&q1);
 		work_ms = (unsigned long)(((double)(q1.QuadPart - q0.QuadPart) * 1000.0) / (double)s_qf.QuadPart);
@@ -750,27 +776,278 @@ static void video_tick()
 	}
 }
 
-// -- window (B1 standalone borderless window: removed. The video now renders
-// into XMPlay's own vis area - see FF_VisRenderDC; the render thread below
-// only decodes into video.dib)
+// -- window (B1): the plugin's own borderless video window. The picture
+// renders HERE on the plugin's own window thread, decoupled from XMPlay's
+// audio/UI threads so the GDI blit can't choke the audio (the XMPlay-vis GDI
+// path did exactly that - see the audio-chop bisection). The decode thread
+// keeps decoding into the DIB and posts WM_APP_VPRESENT; the window thread
+// repaints (double buffered) on its own message loop. All window ops are
+// posted (never cross-thread SendMessage) so they run on the window thread.
+static HWND xmpwin; // XMPlay's main window - the video window's owner
+
+// double-buffered paint of the DIB into the video window's client area. Runs
+// on the window thread only (WM_PAINT). Composes black + frame offscreen,
+// then one BitBlt - no flicker.
+static void video_paint(HDC dc)
+{
+	RECT rc;
+	GetClientRect(video.hwnd, &rc);
+	int cw = rc.right, ch = rc.bottom;
+	if (cw < 1 || ch < 1) return;
+
+	if (!video.memdc || video.memw != cw || video.memh != ch) {
+		if (video.memdc) {
+			SelectObject(video.memdc, video.memold);
+			DeleteObject(video.membmp);
+			DeleteDC(video.memdc);
+		}
+		video.memdc = CreateCompatibleDC(dc);
+		video.membmp = CreateCompatibleBitmap(dc, cw, ch);
+		video.memold = SelectObject(video.memdc, video.membmp);
+		video.memw = cw; video.memh = ch;
+	}
+	HDC mem = video.memdc;
+	RECT full = { 0, 0, cw, ch };
+	FillRect(mem, &full, (HBRUSH)GetStockObject(BLACK_BRUSH)); // clear: no stale pixels around the bars
+
+	if (video.dib && video.dibw >= 1) {
+		// display aspect honors non-square pixels (DVD/TS/MKV anamorphic)
+		double sar = 1.0;
+		AVRational fsar = video.frame_sar;
+		if (fsar.num <= 0 || fsar.den <= 0) fsar = video.sar;
+		if (fsar.num > 0 && fsar.den > 0) sar = (double)fsar.num / fsar.den;
+		double va = (double)video.dibw / video.dibh * sar, wa = (double)cw / ch;
+		int w, h, x, y;
+		if (wa > va) { h = ch; w = (int)(h * va + 0.5); x = (cw - w) / 2; y = 0; }
+		else         { w = cw; h = (int)(w / va + 0.5); x = 0; y = (ch - h) / 2; }
+		if (w < 1) w = 1;
+		if (h < 1) h = 1;
+		if (w == video.dibw && h == video.dibh) {
+			// exact 1:1 fit: no GDI scaling, one cheap direct blit
+			SetDIBitsToDevice(mem, x, y, w, h, 0, 0, 0, 0, video.dib, &video.bmi, DIB_RGB_COLORS);
+		} else {
+			// only when the window is resized off the DIB size: fast nearest
+			// neighbour (value 7), not the slow HALFTONE dither
+			int oldmode = SetStretchBltMode(mem, 7 /* STRETCH_NEARESTNEIGHBOR */);
+			StretchDIBits(mem, x, y, w, h, 0, 0, video.dibw, video.dibh,
+				video.dib, &video.bmi, DIB_RGB_COLORS, SRCCOPY);
+			SetStretchBltMode(mem, oldmode);
+		}
+	}
+	BitBlt(dc, 0, 0, cw, ch, mem, 0, 0, SRCCOPY);
+}
+
+// clear the picture to black (frozen frames must not survive stop/switch)
+static void video_blank()
+{
+	if (!video.dib) return;
+	memset(video.dib, 0, (size_t)video.dibw * video.dibh * 4);
+	InvalidateRect(video.hwnd, 0, FALSE); // repaint on the window thread
+}
+
+// find XMPlay's main top-level window (the video window's owner so it follows
+// the player in z-order). Prefer the foreground window when it's ours; else
+// the first visible top-level window in our process without an owner.
+static BOOL CALLBACK video_enum_proc(HWND hwnd, LPARAM lp)
+{
+	DWORD pid = 0;
+	GetWindowThreadProcessId(hwnd, &pid);
+	if (pid == GetCurrentProcessId() && IsWindowVisible(hwnd) && !GetWindow(hwnd, GW_OWNER)
+		&& hwnd != video.hwnd) {
+		*(HWND*)lp = hwnd;
+		return FALSE;
+	}
+	return TRUE;
+}
+static HWND find_xmpwin()
+{
+	HWND fg = GetForegroundWindow();
+	DWORD pid = 0;
+	if (fg) GetWindowThreadProcessId(fg, &pid);
+	if (fg && pid == GetCurrentProcessId() && fg != video.hwnd) return fg;
+	HWND found = 0;
+	EnumWindows(video_enum_proc, (LPARAM)&found);
+	return found;
+}
+
+// Win11 rounds normal-window corners; our borderless style loses that. Ask
+// DWM for rounded corners, LOADED DYNAMICALLY - dwmapi.dll does not exist on
+// XP and a dynamic load never shows up in the import table, so the XP audit
+// stays clean.
+static void video_round_corners(HWND hwnd)
+{
+	typedef long (WINAPI *DwmSetWindowAttribute_t)(HWND, DWORD, const void *, DWORD);
+	HMODULE dwm = LoadLibraryA("dwmapi.dll");
+	if (!dwm) return;
+	DwmSetWindowAttribute_t pfn = (DwmSetWindowAttribute_t)GetProcAddress(dwm, "DwmSetWindowAttribute");
+	if (pfn) {
+		DWORD pref = 2; // DWMWCP_ROUND
+		pfn(hwnd, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */, &pref, sizeof(pref));
+	}
+}
+
+static void video_toggle_fullscreen()
+{
+	if (!video.hwnd) return;
+	video.fullscreen = !video.fullscreen;
+	if (video.fullscreen) {
+		video.saved_valid = GetWindowPlacement(video.hwnd, &video.saved);
+		HMONITOR mon = MonitorFromWindow(video.hwnd, MONITOR_DEFAULTTONEAREST);
+		MONITORINFO mi; mi.cbSize = sizeof(mi);
+		GetMonitorInfo(mon, &mi);
+		SetWindowLong(video.hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+		SetWindowPos(video.hwnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
+			mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
+			SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+	} else {
+		SetWindowLong(video.hwnd, GWL_STYLE, WS_POPUP | WS_THICKFRAME | WS_VISIBLE);
+		if (video.saved_valid) SetWindowPlacement(video.hwnd, &video.saved);
+		else SetWindowPos(video.hwnd, 0, 0, 0, 0, 640, 480,
+			SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED);
+	}
+	InvalidateRect(video.hwnd, 0, FALSE);
+}
+
+static LRESULT CALLBACK video_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+	switch (msg) {
+	case WM_NCCALCSIZE: // the ENTIRE window is client area: no painted frame
+		return 0;
+	case WM_NCPAINT:
+		return 0;
+	case WM_NCHITTEST: { // borderless: manual resize edges + drag
+		if (video.fullscreen) return HTCLIENT;
+		POINT pt;
+		pt.x = (short)(lp & 0xffff);
+		pt.y = (short)(((DWORD)lp >> 16) & 0xffff);
+		RECT wr; GetWindowRect(hwnd, &wr);
+		int b = 8;
+		BOOL l = pt.x < wr.left + b, r = pt.x >= wr.right - b;
+		BOOL t = pt.y < wr.top + b, bo = pt.y >= wr.bottom - b;
+		if (t && l) return HTTOPLEFT;
+		if (t && r) return HTTOPRIGHT;
+		if (bo && l) return HTBOTTOMLEFT;
+		if (bo && r) return HTBOTTOMRIGHT;
+		if (t) return HTTOP;
+		if (bo) return HTBOTTOM;
+		if (l) return HTLEFT;
+		if (r) return HTRIGHT;
+		return HTCAPTION; // drag anywhere else
+	}
+	case WM_NCLBUTTONDBLCLK:
+		if (wp == HTCAPTION) { video_toggle_fullscreen(); return 0; }
+		break;
+	case WM_LBUTTONDBLCLK:
+		video_toggle_fullscreen();
+		return 0;
+	case WM_GETMINMAXINFO: {
+		MINMAXINFO *mm = (MINMAXINFO*)lp;
+		mm->ptMinTrackSize.x = 160;
+		mm->ptMinTrackSize.y = 120;
+		return 0;
+	}
+	case WM_KEYDOWN:
+		if (wp == 'F') { video_toggle_fullscreen(); return 0; }
+		if (wp == VK_RETURN) { video_toggle_fullscreen(); return 0; }
+		if (wp == VK_ESCAPE) {
+			if (video.fullscreen) video_toggle_fullscreen();
+			else { video.hidden = TRUE; video.win_visible = FALSE; ShowWindow(hwnd, SW_HIDE); }
+			return 0;
+		}
+		break;
+	case WM_PAINT: {
+		PAINTSTRUCT ps;
+		HDC dc = BeginPaint(hwnd, &ps);
+		video_paint(dc);
+		EndPaint(hwnd, &ps);
+		return 0;
+	}
+	case WM_ACTIVATE:
+		// owned-window z-order only guarantees we sit above XMPlay; keep the
+		// owner visible right below us (without stealing focus)
+		if (LOWORD(wp) != WA_INACTIVE && xmpwin)
+			SetWindowPos(xmpwin, video.hwnd, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+		break;
+	case WM_ERASEBKGND:
+		return 1;
+	case WM_APP_VSHOW: {
+		xmpwin = find_xmpwin(); // owner must be XMPlay itself
+		if (xmpwin) SetWindowLong(video.hwnd, GWL_HWNDPARENT, (LONG)xmpwin);
+		video.hidden = FALSE;
+		if (!video.size_set) {
+			SetWindowPos(video.hwnd, HWND_TOP, 0, 0, video.show_w, video.show_h,
+				SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED);
+			video.size_set = TRUE;
+		}
+		ShowWindow(video.hwnd, SW_SHOW);
+		video.win_visible = TRUE;
+		video_round_corners(hwnd);
+		return 0;
+	}
+	case WM_APP_VHIDE:
+		video.hidden = TRUE;
+		video.win_visible = FALSE;
+		ShowWindow(hwnd, SW_HIDE);
+		return 0;
+	case WM_APP_VBLANK:
+		video_blank();
+		return 0;
+	case WM_APP_VPRESENT:
+		InvalidateRect(hwnd, 0, FALSE); // a fresh frame: repaint on this thread
+		return 0;
+	case WM_SIZE:
+		InvalidateRect(hwnd, 0, FALSE);
+		return 0;
+	}
+	return DefWindowProc(hwnd, msg, wp, lp);
+}
+
+// the window thread: owns the video window + its message loop (and the GDI
+// paint that comes with it). Runs below the audio so the window's own work
+// never delays the audio pump either.
+static DWORD WINAPI video_wnd_thread(LPVOID)
+{
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+	WNDCLASSEX wc;
+	memset(&wc, 0, sizeof wc);
+	wc.cbSize = sizeof wc;
+	wc.style = CS_HREDRAW | CS_VREDRAW;
+	wc.lpfnWndProc = video_wndproc;
+	wc.hInstance = dllinst;
+	wc.hCursor = LoadCursor(0, (LPCWSTR)IDC_ARROW);
+	wc.lpszClassName = "XMPFFMPEG_VIDEO";
+	if (!RegisterClassEx(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+		return 1;
+	RECT wr = { 0, 0, 640, 480 };
+	DWORD style = WS_POPUP | WS_THICKFRAME; // thickframe keeps HT* resize; NCCALCSIZE drops the frame
+	AdjustWindowRectEx(&wr, style, FALSE, 0);
+	HWND h = CreateWindowEx(0, wc.lpszClassName, "FFmpeg video", style,
+		CW_USEDEFAULT, CW_USEDEFAULT, 640, 480, 0, 0, wc.hInstance, 0);
+	if (!h) return 1;
+	video.hwnd = h;
+	if (video.active)
+		PostMessage(h, WM_APP_VSHOW, 0, 0); // a track is attached but our VSHOW
+	                                          // may have been lost before we existed
+	MSG m;
+	while (GetMessage(&m, 0, 0) > 0) {
+		TranslateMessage(&m);
+		DispatchMessage(&m);
+	}
+	return 0;
+}
 
 static DWORD WINAPI video_thread(LPVOID)
 {
-	// B2: no window of our own - just keep the latest frame decoded into
-	// video.dib; XMPlay's vis area shows it via FF_VisRenderDC.
-	// The decode thread's periodic CPU bursts (h264 decode + sws, measured
-	// ~5-18ms every ~40ms at 25fps => 5-12% of a core) jitter XMPlay's audio
-	// path: the plugin's own audio pump stays clean (pb: ur=0), but the sound
-	// card DMA / mixer downstream is starved by the decode ticks. Run it at
-	// the LOWEST foreground priority so its bursts always yield to audio work
-	// and can never delay the audio thread. The deep video queue (VQ_TARGET)
-	// absorbs the occasional dropped tick, so the picture stays in sync.
+	// Decode thread: keep the latest frame decoded into video.dib. The picture
+	// is shown in the plugin's OWN window (video_wnd_thread), not the XMPlay
+	// vis - so the GDI blit is off XMPlay's threads and can't choke the audio.
+	// Run at the LOWEST foreground priority so the decode bursts (h264 + sws)
+	// always yield to audio work; the deep video queue absorbs dropped ticks.
 	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
 	while (1) {
-		// vis hidden: no one is looking at the picture - skip the decode+scale
-		// work entirely and idle, so the decode thread contributes zero CPU and
-		// zero scheduling pressure on the audio pump while the vis is closed.
-		if (!video.vis_open && !video.seeking) {
+		// window hidden / not shown: no one is looking at the picture - skip the
+		// decode+scale work entirely and idle (zero CPU + zero pressure on audio).
+		if (!video.win_visible && !video.seeking) {
 			Sleep(250);
 			continue;
 		}
@@ -801,7 +1078,26 @@ static void video_window_init()
 	video.clock_tick = GetTickCount();
 	if (g_video_mode == 1) return; // bisection: video attached, but no decode thread
 	video.thread = CreateThread(0, 0, video_thread, 0, 0, &video.threadid);
+	// the window thread owns the borderless video window + its message loop
+	// (and the GDI paint). It is what keeps the blit off XMPlay's threads.
+	video.wnd_thread = CreateThread(0, 0, video_wnd_thread, 0, 0, &video.wnd_threadid);
 	video.running = TRUE;
+}
+
+// called on attach: size the window to the native video (clamped to the work
+// area) and show it, docked to XMPlay's main window. Runs on the audio thread;
+// the actual window ops are posted to the window thread.
+static void video_show(FFMPEG *f)
+{
+	video_window_init();
+	int w = f->vw > 0 ? f->vw : 640, h = f->vh > 0 ? f->vh : 480;
+	RECT wa;
+	if (SystemParametersInfo(SPI_GETWORKAREA, 0, &wa, 0)) {
+		int maxw = (int)((wa.right - wa.left) * 0.85), maxh = (int)((wa.bottom - wa.top) * 0.85);
+		while (w > maxw || h > maxh) { w = w * 9 / 10; h = h * 9 / 10; }
+	}
+	video.show_w = w; video.show_h = h;
+	PostMessage(video.hwnd, WM_APP_VSHOW, 0, 0); // no-op until the window thread created it
 }
 
 // called after a successful Open: attach this file's video to the vis area
@@ -829,7 +1125,8 @@ static void video_attach(FFMPEG *f)
 	video.seeking = FALSE; // fresh track: not in a seek catch-up
 	video.active = TRUE;
 	LeaveCriticalSection(&video.lock);
-	video_window_init(); // make sure the decoder thread is alive
+	video_window_init(); // ensure the decode + window threads are alive
+	video_show(f);      // show the video window at its native size, docked to XMPlay
 }
 
 // hide + disengage (Close / audio-only / teardown)
@@ -846,6 +1143,13 @@ static void video_detach()
 	video.vis_open = FALSE; // the decode thread idles until the vis reopens
 	video.seeking = FALSE; // stop the fast catch-up cadence
 	LeaveCriticalSection(&video.lock);
+	// hide + clear the video window (posted to the window thread; a no-op if it
+	// was never created). The picture must not survive a stop/track switch.
+	video.win_visible = FALSE;
+	if (video.hwnd) {
+		PostMessage(video.hwnd, WM_APP_VBLANK, 0, 0);
+		PostMessage(video.hwnd, WM_APP_VHIDE, 0, 0);
+	}
 	EnterCriticalSection(&video.qlock);
 	VPKT *p = video.qhead;
 	while (p) { VPKT *n = p->next; av_packet_free(&p->pkt); free(p); p = n; }
@@ -1916,66 +2220,33 @@ static BOOL WINAPI FF_VisRenderDC(HDC dc, SIZE size, DWORD flags)
 		}
 	}
 
-	// playing: the display is live again, so the blank latch is stale
+	// playing: decide what the vis area shows.
 	EnterCriticalSection(&video.lock);
-	video.vis_blank = FALSE;
+	int is_video = (video.vdec != 0);
 	LeaveCriticalSection(&video.lock);
 
-	// no video stream on this track (audio-only): show the skin background plus
-	// LRC lyrics when we have them (fetching happens on a background thread)
-	if (!video.dib || video.dibw < 1 || !video.vdec) {
-		HBRUSH bg = CreateSolidBrush((COLORREF)vis_colors[0]);
-		FillRect(dc, &rc, bg);
-		DeleteObject(bg);
-		lyric_render(dc, size.cx, size.cy); // draws nothing until lyrics are ready
-		return TRUE;
-	}
-
-	EnterCriticalSection(&video.lock);
-	if (!video.have_new) { LeaveCriticalSection(&video.lock); return FALSE; } // unchanged
-	if (g_video_mode == 3) { // bisection: decode runs, but no GDI blit to the vis
-		video.have_new = FALSE;
+	if (is_video) {
+		// video track: the picture lives in the plugin's OWN window, not this
+		// vis area - so the vis just goes black and stops refreshing. No GDI
+		// video blit happens here: that per-frame GDI on XMPlay's thread is
+		// exactly what chokes the audio (the mode-3 bisection).
+		EnterCriticalSection(&video.lock);
+		BOOL need_blank = !video.vis_blank;
+		if (need_blank) video.vis_blank = TRUE;
 		LeaveCriticalSection(&video.lock);
+		if (need_blank) {
+			FillRect(dc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
+			return TRUE; // cleared once; XMPlay stops refreshing a static display
+		}
 		return FALSE;
 	}
-	if (video.dibw >= 1 && video.dibh >= 1) {
-		double sar = 1.0;
-		AVRational fsar = video.frame_sar;
-		if (fsar.num <= 0 || fsar.den <= 0) fsar = video.sar;
-		if (fsar.num > 0 && fsar.den > 0) sar = (double)fsar.num / fsar.den;
-		double va = (double)video.dibw / video.dibh * sar;
-		double wa = (double)size.cx / (size.cy > 0 ? size.cy : 1);
-		int w, h, x, y;
-		if (wa > va) { h = size.cy; w = (int)(h * va + 0.5); x = (size.cx - w) / 2; y = 0; }
-		else          { w = size.cx; h = (int)(w / va + 0.5); x = 0; y = (size.cy - h) / 2; }
-		if (w < 1) w = 1;
-		if (h < 1) h = 1;
-		// GDI cost on XMPlay's UI thread is what chokes the audio - the mode-3
-		// bisection proved that skipping this blit clears the sustained chop.
-		// So keep the blit as cheap as possible:
-		if (x != 0 || y != 0)
-			FillRect(dc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH)); // letterbox bars
-		if (w == video.dibw && h == video.dibh) {
-			// exact 1:1 fit (the default: the vis is suggested at the DIB size) -
-			// no GDI scaling at all, just one cheap direct blit
-			SetDIBitsToDevice(dc, x, y, w, h, 0, 0, 0, 0,
-				video.dib, &video.bmi, DIB_RGB_COLORS);
-		} else {
-			// only when the vis is resized/fullscreened past the DIB: a FAST
-			// nearest-neighbour stretch, not HALFTONE (the dithered bilinear we
-			// used before - the slowest GDI stretch mode)
-			// STRETCH_NEARESTNEIGHBOR = 7 (fast, no dither). The value is used
-			// directly: this XP-era mingw toolchain names the stretch-mode
-			// constants inconsistently (HALFTONE compiled bare), so a literal
-			// avoids a header-dependent constant that could be undeclared.
-			int oldmode = SetStretchBltMode(dc, 7 /* STRETCH_NEARESTNEIGHBOR */);
-			StretchDIBits(dc, x, y, w, h, 0, 0, video.dibw, video.dibh,
-				video.dib, &video.bmi, DIB_RGB_COLORS, SRCCOPY);
-			SetStretchBltMode(dc, oldmode);
-		}
-	}
-	video.have_new = FALSE;
-	LeaveCriticalSection(&video.lock);
+
+	// audio-only track: the vis shows the skin background + LRC lyrics,
+	// redrawn each refresh until the lyrics change (fetching is backgrounded)
+	HBRUSH bg = CreateSolidBrush((COLORREF)vis_colors[0]);
+	FillRect(dc, &rc, bg);
+	DeleteObject(bg);
+	lyric_render(dc, size.cx, size.cy); // draws nothing until lyrics are ready
 	return TRUE;
 }
 
