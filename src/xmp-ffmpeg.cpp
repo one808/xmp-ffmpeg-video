@@ -655,6 +655,12 @@ static DWORD WINAPI video_thread(LPVOID)
 {
 	// B2: no window of our own - just keep the latest frame decoded into
 	// video.dib; XMPlay's vis area shows it via FF_VisRenderDC.
+	// Run below the audio pump: video_tick holds video.lock across its
+	// decode+scale work, and the audio thread's video_enqueue blocks on that
+	// lock. At equal priority the heavy video tick starves the audio pump and
+	// shows up as "video track -> constant mild audio choppiness" (underrun).
+	// Yielding to audio keeps the queue handoff from dragging the audio pump.
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
 	while (1) {
 		video_tick();
 		// during a seek catch-up run at ~1kHz instead of 66Hz: the queued
