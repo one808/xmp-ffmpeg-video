@@ -922,7 +922,8 @@ static BOOL sdl_setup(int w, int h)
 	if (!sdl_ren)
 		sdl_ren = SDL_CreateRenderer(sdl_win, -1, 0); // software fallback
 	if (sdl_ren) {
-		logmsg("dv: SDL renderer ok (%s)", SDL_GetRendererName(sdl_ren));
+		SDL_RendererInfo ri; SDL_GetRendererInfo(sdl_ren, &ri);
+		logmsg("dv: SDL renderer ok (%s)", ri.name);
 		return TRUE;
 	}
 	logmsg("dv: SDL renderer failed: %s", SDL_GetError());
@@ -935,7 +936,7 @@ static HWND sdl_native(void)
 	if (!sdl_win) return 0;
 	SDL_SysWMinfo si;
 	if (SDL_GetWindowWMInfo(sdl_win, &si) == SDL_TRUE)
-		return si.info.win.win_window;
+		return si.info.win.window;
 	return 0;
 }
 
@@ -976,8 +977,9 @@ static void sdl_present(void)
 	int vw = cw, vh2 = ch, vx = 0, vy = 0;
 	if (wa > va) { vw = (int)(ch * va + 0.5); vx = (cw - vw) / 2; }
 	else         { vh2 = (int)(cw / va + 0.5); vy = (ch - vh2) / 2; }
+	SDL_Rect dst = { vx, vy, vw, vh2 };
 	SDL_RenderClear(sdl_ren);
-	SDL_RenderCopy(sdl_ren, sdl_tex, 0, &(SDL_Rect){ vx, vy, vw, vh2 });
+	SDL_RenderCopy(sdl_ren, sdl_tex, 0, &dst);
 	SDL_RenderPresent(sdl_ren);
 }
 
@@ -986,12 +988,12 @@ static void sdl_present(void)
 static void sdl_fullscreen_toggle(void)
 {
 	if (!sdl_win) return;
-	if (SDL_GetWindowFlags(sdl_win) & SDL_WINDOW_FULLSCREEN_EXCLUSIVE)
+	if (SDL_GetWindowFlags(sdl_win) & SDL_WINDOW_FULLSCREEN)
 		SDL_SetWindowFullscreen(sdl_win, 0);
 	else
-		SDL_SetWindowFullscreen(sdl_win, SDL_WINDOW_FULLSCREEN_EXCLUSIVE);
+		SDL_SetWindowFullscreen(sdl_win, SDL_WINDOW_FULLSCREEN);
 	logmsg("dv: SDL fullscreen -> %s",
-		(SDL_GetWindowFlags(sdl_win) & SDL_WINDOW_FULLSCREEN_EXCLUSIVE)
+		(SDL_GetWindowFlags(sdl_win) & SDL_WINDOW_FULLSCREEN)
 			? "exclusive" : "windowed/desktop");
 }
 
@@ -1504,7 +1506,7 @@ static LRESULT sdl_msg_handler(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 		video.hidden = TRUE;
 		video.win_visible = FALSE;
 		// a hidden window must not keep the display in D3D exclusive mode
-		if (sdl_win && (SDL_GetWindowFlags(sdl_win) & SDL_WINDOW_FULLSCREEN_EXCLUSIVE))
+		if (sdl_win && (SDL_GetWindowFlags(sdl_win) & SDL_WINDOW_FULLSCREEN))
 			SDL_SetWindowFullscreen(sdl_win, 0);
 		if (sdl_win) SDL_HideWindow(sdl_win);
 		return 0;
@@ -1547,7 +1549,7 @@ static void sdl_pump_keys(void)
 				e.key.keysym.sym == SDLK_KP_ENTER)
 				sdl_fullscreen_toggle();
 			else if (e.key.keysym.sym == SDLK_ESCAPE) {
-				if (SDL_GetWindowFlags(sdl_win) & SDL_WINDOW_FULLSCREEN_EXCLUSIVE)
+				if (SDL_GetWindowFlags(sdl_win) & SDL_WINDOW_FULLSCREEN)
 					SDL_SetWindowFullscreen(sdl_win, 0);
 				else {
 					video.hidden = TRUE; video.win_visible = FALSE;
