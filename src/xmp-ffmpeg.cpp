@@ -917,7 +917,7 @@ static void sdl_release(void)
 static BOOL sdl_setup(int w, int h)
 {
 	if (sdl_ren) return TRUE;
-	if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+	if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) {
 		logmsg("dv: SDL_Init failed: %s", SDL_GetError());
 		return FALSE;
 	}
@@ -958,11 +958,13 @@ static BOOL sdl_ensure_tex(int w, int h)
 	if (sdl_tex && sdl_tex_w == w && sdl_tex_h == h) return TRUE;
 	if (sdl_tex) { SDL_DestroyTexture(sdl_tex); sdl_tex = 0; }
 	// the DIB is BGRA in memory; SDL_PIXELFORMAT_BGRA8888 matches byte order
-	if (SDL_CreateTexture(sdl_ren, SDL_PIXELFORMAT_BGRA8888,
-		SDL_TEXTUREACCESS_STREAMING, w, h) == NULL) {
-		logmsg("dv: SDL_CreateTexture failed: %s", SDL_GetError());
-		return FALSE;
-	}
+	{ SDL_Texture *t = SDL_CreateTexture(sdl_ren, SDL_PIXELFORMAT_BGRA8888,
+		SDL_TEXTUREACCESS_STREAMING, w, h);
+	  if (t == NULL) {
+		  logmsg("dv: SDL_CreateTexture failed: %s", SDL_GetError());
+		  return FALSE;
+	  }
+	  sdl_tex = t; }
 	sdl_tex_w = w; sdl_tex_h = h;
 	return TRUE;
 }
@@ -1043,6 +1045,10 @@ static int sa_open(FFMPEG *f)
 	if (f->dec->ch_layout.nb_channels > 2) {
 		logmsg("dv: SDL audio: %d channels unsupported -> mixer",
 			f->dec->ch_layout.nb_channels);
+		return 0;
+	}
+	if (SDL_Init(SDL_INIT_AUDIO) != 0) {
+		logmsg("dv: SDL audio init failed: %s", SDL_GetError());
 		return 0;
 	}
 	// WASAPI shared accepts these rates; anything else resamples to 48k
