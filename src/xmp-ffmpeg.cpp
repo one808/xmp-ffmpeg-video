@@ -957,8 +957,13 @@ static BOOL sdl_ensure_tex(int w, int h)
 	if (!sdl_ren || w < 1 || h < 1) return FALSE;
 	if (sdl_tex && sdl_tex_w == w && sdl_tex_h == h) return TRUE;
 	if (sdl_tex) { SDL_DestroyTexture(sdl_tex); sdl_tex = 0; }
-	// the DIB is BGRA in memory; SDL_PIXELFORMAT_BGRA8888 matches byte order
-	{ SDL_Texture *t = SDL_CreateTexture(sdl_ren, SDL_PIXELFORMAT_BGRA8888,
+	// the DIB holds FFmpeg BGRA bytes: [B,G,R,0] (B in the low byte - that is
+	// why GDI shows it correctly as a 32bpp top-down DIB). SDL's packed order
+	// is named HIGH bit -> LOW bit, so that layout is ARGB8888 (A at bits
+	// 24-31, R 16-23, G 8-15, B 0-7 => memory [B,G,R,A]). BGRA8888 and
+	// ABGR8888 both mis-interpret the bytes (R/B and G/R swaps - the "blue
+	// tint" seen with BGRA8888).
+	{ SDL_Texture *t = SDL_CreateTexture(sdl_ren, SDL_PIXELFORMAT_ARGB8888,
 		SDL_TEXTUREACCESS_STREAMING, w, h);
 	  if (t == NULL) {
 		  logmsg("dv: SDL_CreateTexture failed: %s", SDL_GetError());
