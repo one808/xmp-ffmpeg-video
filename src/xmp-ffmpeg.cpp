@@ -66,7 +66,12 @@ static DWORD vis_colors[3];        // skin colors from FF_VisOpen (bg,text1,text
 #define WM_APP_VBLANK  (WM_APP + 3) // clear the picture to black
 #define WM_APP_VPRESENT (WM_APP + 4) // a fresh frame is in the DIB: repaint
 // bisection switch ("FFmpeg video"/VideoMode in XMPlay's registry face):
-//   0 = full video (default)  1 = video attached but NO decode thread
+//   0 = full video in the plugin's own D3D window (default). Audio-priority:
+//       when the window is hidden (ESC / audio-only) the D3D device is released
+//       so the audio path returns to pure-audio behavior; F / double-click
+//       switches to EXCLUSIVE fullscreen (no DWM) for the cleanest audio
+//       while actually watching.
+//   1 = video attached but NO decode thread
 //   2 = play as audio-only (no video attach; LRC lyrics show instead)
 //   3 = decode runs, but the GDI blit to the vis area is skipped (picture
 //       not shown) - isolates the GDI render from the decode CPU
@@ -892,6 +897,9 @@ static void d3d_release(void)
 	if (d3d_mod) { FreeLibrary(d3d_mod); d3d_mod = 0; }
 }
 
+static BOOL d3d_ensure_tex(int w, int h);
+static void d3d_prime(void); // prime the driver's first present cycle (defined below)
+
 static BOOL d3d_init(HWND hwnd)
 {
 	if (d3dev) return TRUE;
@@ -921,7 +929,28 @@ static BOOL d3d_init(HWND hwnd)
 		d3d_release();
 		return FALSE;
 	}
+	d3d_prime(); // run the driver's first present cycle (see d3d_prime)
 	return TRUE;
+}
+
+// Prime the device: render one empty (black) frame and Present it. This
+// completes the driver's initial present cycle so that the first real
+// texture upload is not blocked on it. (With a SYSTEMMEM texture the lock
+// does not deadlock, but the first present still warms up the back buffer
+// and the compositing path - without this, the first real frame can arrive
+// a beat late or the surface stays uninitialised on some drivers.)
+static void d3d_prime(void)
+{
+	if (!d3dev) return;
+	HRESULT tl = d3dev->TestCooperativeLevel();
+	if (tl == D3DERR_DEVICELOST || tl == D3DERR_DEVICENOTRESET)
+		if (d3dev->Reset(&d3pp) != D3D_OK) return;
+	d3dev->SetRenderTarget(0, 0);
+	d3dev->BeginScene();
+	d3dev->Clear(0, 0, D3DCLEAR_TARGET, 0xFF000000, -1.0f, 0);
+	d3dev->EndScene();
+	HRESULT ph = d3dev->Present(0, 0, 0, 0);
+	logmsg("dv: d3d_prime present hr=0x%08X", (unsigned)ph);
 }
 
 static BOOL d3d_ensure_tex(int w, int h)
@@ -929,7 +958,14 @@ static BOOL d3d_ensure_tex(int w, int h)
 	if (!d3dev) return FALSE;
 	if (d3tex && d3tex_w == w && d3tex_h == h) return TRUE;
 	if (d3tex) { d3tex->Release(); d3tex = 0; }
-	if (d3dev->CreateTexture(w, h, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &d3tex, 0) != D3D_OK)
+	// SYSTEMMEM, not DEFAULT: a DEFAULT-pool texture's LockRect fails with
+	// D3DERR_WASGATOCYCL until the driver's present cycle has completed at
+	// least once - and before the first present it never completes
+	// (upload needs the lock, the lock needs a finished present cycle:
+	// deadlock; the window stays transparent). A system-memory texture is
+	// locked by the CPU directly (no GPU cycle involved); the driver moves
+	// it to the GPU at Present. 720p-class uploads are trivial either way.
+	if (d3dev->CreateTexture(w, h, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM, &d3tex, 0) != D3D_OK)
 		return FALSE;
 	d3tex_w = w; d3tex_h = h;
 	return TRUE;
@@ -971,6 +1007,7 @@ static void d3d_present(void)
 			return;
 		}
 		if (d3tex) { d3tex->Release(); d3tex = 0; }
+		d3d_prime(); // re-run the first present cycle after the reset
 	}
 	if (!d3d_ensure_tex(video.dibw, video.dibh)) return;
 
@@ -1106,6 +1143,71 @@ static void video_round_corners(HWND hwnd)
 	}
 }
 
+// exclusive-fullscreen D3D: reset the device into D3D's OWN fullscreen
+// mode - the video surface stops going through DWM composition (the
+// DWM-coupled present is what jitters the audio on this machine). The GDI
+// window stays VISIBLE (borderless, topmost, full-screen) only so it keeps
+// keyboard focus and can be left with F / ESC; the exclusive D3D surface
+// renders on top of it, so the window's own pixels are never what you see.
+// If the driver refuses exclusive (some multi-monitor / virtual setups),
+// the caller falls back to the old borderless-windowed fullscreen.
+static BOOL video_fullscreen_exclusive_on()
+{
+	if (!d3dev) return FALSE;
+	D3DPRESENT_PARAMETERS fspp;
+	memcpy(&fspp, &d3pp, sizeof fspp);
+	fspp.Windowed = FALSE;
+	fspp.hDeviceWindow = 0;
+	fspp.SwapEffect = D3DSWAPEFFECT_FLIP; // fullscreen: FLIP is supported
+	fspp.BackBufferCount = 1;
+	fspp.BackBufferFormat = D3DFMT_X8R8G8B8;
+	fspp.BackBufferWidth = (UINT)GetSystemMetrics(SM_CXSCREEN);
+	fspp.BackBufferHeight = (UINT)GetSystemMetrics(SM_CYSCREEN);
+	fspp.FullScreen_RefreshRateInHertz = 0; // keep the display's current mode
+	if (d3tex) { d3tex->Release(); d3tex = 0; } // dies with the reset
+	if (d3dev->Reset(&fspp) != D3D_OK) {
+		d3dev->Reset(&d3pp); // back to windowed
+		return FALSE;
+	}
+	d3pp = fspp; // the device-lost recovery path must reset to THESE params
+	// keep the window visible, borderless, topmost, covering the primary
+	// screen - it holds focus (so F/ESC still work); the exclusive surface
+	// draws over it.
+	SetWindowLong(video.hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+	SetWindowLong(video.hwnd, GWL_EXSTYLE,
+		GetWindowLong(video.hwnd, GWL_EXSTYLE) | WS_EX_TOPMOST);
+	HMONITOR mon = MonitorFromWindow(video.hwnd, MONITOR_DEFAULTTONEAREST);
+	MONITORINFO mi; mi.cbSize = sizeof(mi);
+	GetMonitorInfo(mon, &mi);
+	SetWindowPos(video.hwnd, HWND_TOPMOST, mi.rcMonitor.left, mi.rcMonitor.top,
+		mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
+		SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_NOACTIVATE);
+	d3d_prime();
+	logmsg("dv: exclusive fullscreen on (%ux%u)",
+		fspp.BackBufferWidth, fspp.BackBufferHeight);
+	return TRUE;
+}
+
+static void video_fullscreen_exclusive_off()
+{
+	if (!d3dev || d3pp.Windowed) return;
+	D3DPRESENT_PARAMETERS wspp;
+	memcpy(&wspp, &d3pp, sizeof wspp);
+	wspp.Windowed = TRUE;
+	wspp.hDeviceWindow = video.hwnd;
+	wspp.SwapEffect = D3DSWAPEFFECT_COPY;
+	wspp.BackBufferWidth = 0; // 0 = keep the current (windowed) size
+	wspp.BackBufferHeight = 0;
+	if (d3tex) { d3tex->Release(); d3tex = 0; }
+	if (d3dev->Reset(&wspp) != D3D_OK) { d3pp.Windowed = TRUE; return; }
+	d3pp = wspp;
+	SetWindowLong(video.hwnd, GWL_STYLE, WS_POPUP | WS_THICKFRAME | WS_VISIBLE);
+	SetWindowLong(video.hwnd, GWL_EXSTYLE,
+		GetWindowLong(video.hwnd, GWL_EXSTYLE) & ~WS_EX_TOPMOST);
+	d3d_prime();
+	logmsg("dv: exclusive fullscreen off");
+}
+
 static void video_toggle_fullscreen()
 {
 	if (!video.hwnd) return;
@@ -1113,14 +1215,21 @@ static void video_toggle_fullscreen()
 	if (video.fullscreen) {
 		video.saved.length = sizeof(video.saved);
 		video.saved_valid = GetWindowPlacement(video.hwnd, &video.saved);
-		HMONITOR mon = MonitorFromWindow(video.hwnd, MONITOR_DEFAULTTONEAREST);
-		MONITORINFO mi; mi.cbSize = sizeof(mi);
-		GetMonitorInfo(mon, &mi);
-		SetWindowLong(video.hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
-		SetWindowPos(video.hwnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
-			mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
-			SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+		if (!video_fullscreen_exclusive_on()) {
+			// the driver refused exclusive: borderless WINDOWED fullscreen
+			// (DWM-composited - the old behavior)
+			HMONITOR mon = MonitorFromWindow(video.hwnd, MONITOR_DEFAULTTONEAREST);
+			MONITORINFO mi; mi.cbSize = sizeof(mi);
+			GetMonitorInfo(mon, &mi);
+			SetWindowLong(video.hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+			SetWindowPos(video.hwnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
+				mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
+				SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+			logmsg("dv: exclusive fullscreen refused -> windowed fallback");
+		}
 	} else {
+		if (!d3pp.Windowed)
+			video_fullscreen_exclusive_off(); // windowed D3D + restore style
 		SetWindowLong(video.hwnd, GWL_STYLE, WS_POPUP | WS_THICKFRAME | WS_VISIBLE);
 		if (video.saved_valid) SetWindowPlacement(video.hwnd, &video.saved);
 		else SetWindowPos(video.hwnd, 0, 0, 0, 640, 480,
@@ -1208,6 +1317,7 @@ static LRESULT CALLBACK video_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 		}
 		ShowWindow(video.hwnd, SW_SHOW);
 		video.win_visible = TRUE;
+		if (!d3dev) d3d_init(hwnd); // re-wake the device (powered down on hide)
 		video_round_corners(hwnd);
 		return 0;
 	}
@@ -1215,6 +1325,14 @@ static LRESULT CALLBACK video_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 		video.hidden = TRUE;
 		video.win_visible = FALSE;
 		ShowWindow(hwnd, SW_HIDE);
+		if (!video.fullscreen) {
+			// AUDIO-PRIORITY POWER DOWN: the user hid the picture (ESC) - the
+			// decode thread is already idling, and now the D3D device + its
+			// driver/DWM registration go away too, so the audio path returns
+			// to pure-audio-track behavior until the next show.
+			d3d_release();
+			logmsg("dv: video hidden -> D3D device released (audio-priority idle)");
+		}
 		return 0;
 	case WM_APP_VBLANK:
 		video_blank();
@@ -3133,6 +3251,36 @@ extern "C" __declspec(dllexport) XMPIN *WINAPI XMPIN_GetInterface(DWORD face, In
 	return &xmpin;
 }
 
+// ------------------------------------------------------- high-resolution timer
+// The audio mixer's thin buffer turns ANY system DPC / timer-wakeup jitter
+// into audible chop on video tracks (the video path keeps the CPU + the
+// display pipeline busy). Requesting the 1ms timer period while the plugin
+// is loaded keeps the system's short sleeps and timer DPCs precise instead
+// of letting them coalesce at 15.6ms (the classic Win32 default) - the
+// standard mitigation for this class of audio glitch. winmm.dll is loaded
+// DYNAMICALLY (never in the import table) so the XP-compat audit stays
+// clean; on XP winmm.dll + timeBeginPeriod have always existed.
+static HMODULE g_winmm = 0;
+static BOOL (WINAPI *g_time_begin_period)(unsigned) = 0;
+static BOOL (WINAPI *g_time_end_period)(unsigned) = 0;
+
+static void timer_period_begin(void)
+{
+	g_winmm = LoadLibraryA("winmm.dll");
+	if (!g_winmm) return;
+	g_time_begin_period = (BOOL (WINAPI *)(unsigned))
+		GetProcAddress(g_winmm, "timeBeginPeriod");
+	g_time_end_period = (BOOL (WINAPI *)(unsigned))
+		GetProcAddress(g_winmm, "timeEndPeriod");
+	if (g_time_begin_period) g_time_begin_period(1);
+}
+
+static void timer_period_end(void)
+{
+	if (g_time_end_period) g_time_end_period(1);
+	if (g_winmm) { FreeLibrary(g_winmm); g_winmm = 0; }
+}
+
 #ifdef _WIN32
 BOOL WINAPI DllMain(HINSTANCE hDLL, DWORD reason, LPVOID reserved)
 {
@@ -3142,8 +3290,11 @@ BOOL WINAPI DllMain(HINSTANCE hDLL, DWORD reason, LPVOID reserved)
 		dllinst = hDLL;
 		InitializeCriticalSection(&lyric.lock);
 		InitializeCriticalSection(&lyric_thread_lock);
+		timer_period_begin(); // 1ms timer period: precise short sleeps for the
+		                      // audio/video paths (freed in PROCESS_DETACH)
 		break;
 	case DLL_PROCESS_DETACH:
+		timer_period_end();
 		if (ws_init_done) WSACleanup();
 		if (lyric_fetch_handle) CloseHandle(lyric_fetch_handle);
 		DeleteCriticalSection(&lyric_thread_lock);
