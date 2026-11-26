@@ -56,6 +56,11 @@ static XMPFUNC_REGISTRY *xmpfreg;
 static DWORD xmpver;
 static HINSTANCE dllinst;           // our DLL instance (vis config dialog resource)
 static DWORD vis_colors[3];        // skin colors from FF_VisOpen (bg,text1,text2)
+// bisection switch ("FFmpeg video"/VideoMode in XMPlay's registry face):
+//   0 = full video (default)  1 = video attached but NO decode thread
+//   2 = play as audio-only (no video attach; LRC lyrics show instead)
+// Used to isolate which part of the video path chokes the audio on video tracks.
+static int g_video_mode = 0;
 
 struct FFMPEG {
 	XMPFILE file;
@@ -723,6 +728,7 @@ static void video_window_init()
 	if (video.running) return;
 	video.clock_base = 0;
 	video.clock_tick = GetTickCount();
+	if (g_video_mode == 1) return; // bisection: video attached, but no decode thread
 	video.thread = CreateThread(0, 0, video_thread, 0, 0, &video.threadid);
 	video.running = TRUE;
 }
@@ -1944,8 +1950,15 @@ static DWORD WINAPI FF_Open(const char *filename, XMPFILE file)
 	xmpfin->SetLength((float)(current->duration > 0 ? current->duration : -1), current->seekable);
 	if (current->netfile)
 		xmpffile->NetSetRate(file, current->bitrate ? current->bitrate * 125 : 32000);
-	video_attach(current); // attach the vis video iff this file has a video stream
-	if (current->vstream < 0) {
+	// read the bisection switch each open so it can be flipped without a rebuild
+	{ int vm = 0;
+	  if (xmpfreg && xmpfreg->GetInt(LRC_REGSEC, "VideoMode", &vm))
+		  g_video_mode = (vm >= 0 && vm <= 2) ? vm : 0;
+	  else g_video_mode = 0;
+	  logmsg("cb: VideoMode=%d", g_video_mode); }
+	if (g_video_mode != 2)
+		video_attach(current); // attach the vis video iff this file has a video stream
+	if (current->vstream < 0 || g_video_mode == 2) {
 		// audio-only track: load LRC lyrics (sidecar -> embedded tags -> service)
 		char artist[512] = "", title[512] = "";
 		AVDictionary *md[2] = { current->fmt->metadata,
@@ -2091,6 +2104,7 @@ static void WINAPI FF_GetMessage(char *buf)
 // as soon as one shows up.
 static void video_late_scan(FFMPEG *f)
 {
+	if (g_video_mode == 2) return; // forced audio-only: never attach video
 	if (f->vstream >= 0 || video.active) return;
 	if (--f->recheck > 0) return;
 	f->recheck = 200; // roughly every few seconds of audio
