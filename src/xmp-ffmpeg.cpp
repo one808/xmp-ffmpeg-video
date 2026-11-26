@@ -891,6 +891,7 @@ static void video_toggle_fullscreen()
 	if (!video.hwnd) return;
 	video.fullscreen = !video.fullscreen;
 	if (video.fullscreen) {
+		video.saved.length = sizeof(video.saved);
 		video.saved_valid = GetWindowPlacement(video.hwnd, &video.saved);
 		HMONITOR mon = MonitorFromWindow(video.hwnd, MONITOR_DEFAULTTONEAREST);
 		MONITORINFO mi; mi.cbSize = sizeof(mi);
@@ -902,7 +903,7 @@ static void video_toggle_fullscreen()
 	} else {
 		SetWindowLong(video.hwnd, GWL_STYLE, WS_POPUP | WS_THICKFRAME | WS_VISIBLE);
 		if (video.saved_valid) SetWindowPlacement(video.hwnd, &video.saved);
-		else SetWindowPos(video.hwnd, 0, 0, 0, 0, 640, 480,
+		else SetWindowPos(video.hwnd, 0, 0, 0, 640, 480,
 			SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED);
 	}
 	InvalidateRect(video.hwnd, 0, FALSE);
@@ -1014,7 +1015,7 @@ static DWORD WINAPI video_wnd_thread(LPVOID)
 	wc.style = CS_HREDRAW | CS_VREDRAW;
 	wc.lpfnWndProc = video_wndproc;
 	wc.hInstance = dllinst;
-	wc.hCursor = LoadCursor(0, (LPCWSTR)IDC_ARROW);
+	wc.hCursor = LoadCursor(0, (LPCSTR)IDC_ARROW);
 	wc.lpszClassName = "XMPFFMPEG_VIDEO";
 	if (!RegisterClassEx(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
 		return 1;
@@ -1029,7 +1030,7 @@ static DWORD WINAPI video_wnd_thread(LPVOID)
 		PostMessage(h, WM_APP_VSHOW, 0, 0); // a track is attached but our VSHOW
 	                                          // may have been lost before we existed
 	MSG m;
-	while (GetMessage(&m, 0, 0) > 0) {
+	while (GetMessage(&m, 0, 0, 0) > 0) {
 		TranslateMessage(&m);
 		DispatchMessage(&m);
 	}
