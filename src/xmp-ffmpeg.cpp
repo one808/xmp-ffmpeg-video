@@ -153,19 +153,33 @@ static void video_detach();
 // Always-on lightweight log so field problems are diagnosable from the file.
 // Location: %TEMP%\xmp-ffmpeg-video.log
 
-static void logmsg(const char *fmt, ...)
+// persistent log handle: opened once and kept open, guarded by a lock. The
+// old per-call fopen("a")+fclose ran on the audio pump thread every 100ms and
+// was a source of I/O jitter - a contributor to the "audio choppiness on
+// video tracks". A shared, always-open handle makes logmsg cheap and safe.
+static FILE *g_logf = 0;
+static CRITICAL_SECTION g_loglock;
+
+static void log_open(void)
 {
+	if (g_logf) return;
 	char dir[300];
 	if (!GetTempPathA(300, dir)) return;
 	strcat(dir, "xmp-ffmpeg-video.log");
-	FILE *f = fopen(dir, "a");
-	if (!f) return;
-	va_list ap;
-	va_start(ap, fmt);
-	vfprintf(f, fmt, ap);
-	va_end(ap);
-	fputc('\n', f);
-	fclose(f);
+	g_logf = fopen(dir, "a");
+}
+static void logmsg(const char *fmt, ...)
+{
+	EnterCriticalSection(&g_loglock);
+	log_open();
+	if (g_logf) {
+		va_list ap;
+		va_start(ap, fmt);
+		vfprintf(g_logf, fmt, ap);
+		va_end(ap);
+		fputc('\n', g_logf);
+	}
+	LeaveCriticalSection(&g_loglock);
 }
 
 // route FFmpeg's own log into ours - network/TLS failures then show up with
@@ -173,14 +187,14 @@ static void logmsg(const char *fmt, ...)
 static void ff_log_cb(void *avcl, int level, const char *fmt, va_list vl)
 {
 	if (level > AV_LOG_INFO) return;
-	char dir[300];
-	if (!GetTempPathA(300, dir)) return;
-	strcat(dir, "xmp-ffmpeg-video.log");
-	FILE *f = fopen(dir, "a");
-	if (!f) return;
-	fputs("  ff: ", f);
-	vfprintf(f, fmt, vl);
-	fclose(f);
+	EnterCriticalSection(&g_loglock);
+	log_open();
+	if (g_logf) {
+		fputs("  ff: ", g_logf);
+		vfprintf(g_logf, fmt, vl);
+		fputc('\n', g_logf);
+	}
+	LeaveCriticalSection(&g_loglock);
 }
 
 // ---------------------------------------------------------------- XMPFILE I/O
@@ -2123,6 +2137,7 @@ static DWORD WINAPI FF_Process(float *buffer, DWORD count)
 				f->pos, xmpfstatus ? xmpfstatus->GetTime() : -1.0);
 		}
 	}
+	DWORD w0 = GetTickCount(); // audio-pump work timing (see pb: diagnostics)
 	EnterCriticalSection(&demux_lock);
 	DWORD done = 0;
 	int ch = f->dec->ch_layout.nb_channels;
@@ -2295,6 +2310,26 @@ static DWORD WINAPI FF_Process(float *buffer, DWORD count)
 		}
 	}
 	LeaveCriticalSection(&demux_lock);
+	{
+		// audio-pump diagnostics: how long the demux+decode took and whether
+		// the buffer was left short (underrun -> a gap XMPlay hears). Printed
+		// ~5/sec so the pattern is visible. Shows whether "audio choppiness on
+		// video tracks" is the pump running long / underrunning.
+		static DWORD pb_last = 0;
+		static DWORD pb_worst = 0;
+		static unsigned long pb_ur = 0;
+		DWORD now = GetTickCount();
+		DWORD dur = now - w0;
+		if (dur > pb_worst) pb_worst = dur;
+		if (done < count) pb_ur++;
+		if (now - pb_last >= 200) {
+			logmsg("pb: worst_ms=%lu underruns=%lu fpos=%.2f",
+				(unsigned long)pb_worst, pb_ur, f->pos);
+			pb_last = now;
+			pb_worst = 0;
+			pb_ur = 0;
+		}
+	}
 	return done;
 }
 
@@ -2433,6 +2468,7 @@ extern "C" __declspec(dllexport) XMPIN *WINAPI XMPIN_GetInterface(DWORD face, In
 	xmpfstatus = (XMPFUNC_STATUS*)faceproc(XMPFUNC_STATUS_FACE);
 	xmpfreg   = (XMPFUNC_REGISTRY*)faceproc(XMPFUNC_REGISTRY_FACE);
 	xmpver = xmpfmisc->GetVersion();
+	InitializeCriticalSection(&g_loglock); // log handle + guard (cheap logmsg)
 	InitializeCriticalSection(&video.lock);
 	InitializeCriticalSection(&video.qlock);
 	InitializeCriticalSection(&demux_lock);
