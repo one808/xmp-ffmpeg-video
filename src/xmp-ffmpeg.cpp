@@ -976,13 +976,21 @@ static void d3d_present(void)
 
 	{ // copy the DIB into the texture (row by row; the pitch may differ)
 		D3DLOCKED_RECT lr;
+		// DONOTWAIT fails with D3DERR_WASGATOCYCL (0x8876086C) while the
+		// texture is in the driver's present cycle - and BEFORE the first
+		// successful present that cycle never drains, so DONOTWAIT fails
+		// forever and the window gets no pixels (looks transparent). The
+		// waiting variant breaks the deadlock: it blocks at most ~1 frame,
+		// on this LOWEST-priority window thread, and never on the audio.
 		HRESULT lh = d3tex->LockRect(0, &lr, 0, D3DLOCK_DONOTWAIT);
+		if (lh != D3D_OK)
+			lh = d3tex->LockRect(0, &lr, 0, D3DLOCK_WAIT);
 		if (lh != D3D_OK) {
 			static DWORD s_lock_log = 0;
 			DWORD now = GetTickCount();
 			if (now - s_lock_log >= 1000) {
 				s_lock_log = now;
-				logmsg("dv: LockRect failing hr=0x%08X", (unsigned)lh);
+				logmsg("dv: LockRect failing hr=0x%08X coop=0x%08X", (unsigned)lh, (unsigned)tl);
 			}
 			return;
 		}
