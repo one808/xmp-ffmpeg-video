@@ -103,6 +103,11 @@ static CRITICAL_SECTION demux_lock; // guards av_read_frame/av_seek_frame/send
 // packets ~just-in-time; see the post-seek judder, v1.2.43 logs)
 #define VQ_TARGET 60
 #define VQ_LOOKAHEAD_MAX 64
+// the render DIB (and thus the sws_scale target) is capped at this long side:
+// scaling 1080p/4K to full res every frame is the decode thread's main CPU
+// cost, and its periodic bursts jitter the audio pump (audio chop on video
+// tracks). 720p-class output is plenty for the vis area; StretchDIBits ups it.
+#define VIDEO_DIB_MAX 1280
 
 // --------------------------------------------------------------- video state
 
@@ -140,6 +145,8 @@ struct VIDEO {
 	BYTE *dib;                 // BGRA DIBits
 	BITMAPINFO bmi;
 	int dibw, dibh;
+	volatile BOOL vis_open;     // vis area open (FF_VisOpen / FF_VisClose)
+	int sws_tw, sws_th;         // sws TARGET (DIB) size - capped for CPU, not full res
 	// playback clock: captured on XMPlay's thread, interpolated here. The
 	// render thread must NEVER call XMPlay functions (deadlock risk).
 	double clock_base;
@@ -562,22 +569,38 @@ static BOOL video_make_dib(int w, int h)
 
 // Scale the decoded frame in vframe into the shared DIB (video.dib). Caller
 // holds video.lock. No GDI here - FF_VisRenderDC later blits this buffer into
-// XMPlay's own visualisation area.
+// XMPlay's own visualisation area. The DIB is sized to the DISPLAY, not the
+// source: full-res (1080p/4K) sws_scale every frame is the decode thread's
+// main CPU cost, and its periodic bursts are what jitters the audio pump on
+// video tracks. Capping the target to VIDEO_DIB_MAX makes the scale cheap;
+// FF_VisRenderDC's StretchDIBits then ups it to the vis area.
 static void video_render_frame()
 {
 	AVFrame *fr = video.vframe;
 	if (fr->width < 1 || fr->height < 1) return;
-	if (!video_make_dib(fr->width, fr->height)) return;
+	// target DIB size: the source, scaled down so its long side <= VIDEO_DIB_MAX
+	long long L = (fr->width > fr->height) ? fr->width : fr->height;
+	int sw = fr->width, sh = fr->height;
+	if (L > VIDEO_DIB_MAX) {
+		double r = (double)VIDEO_DIB_MAX / (double)L;
+		sw = (int)(fr->width * r + 0.5);
+		sh = (int)(fr->height * r + 0.5);
+	}
+	sw &= ~1; sh &= ~1; // YUV420P scale wants even dims
+	if (sw < 2) sw = 2;
+	if (sh < 2) sh = 2;
+	if (!video_make_dib(sw, sh)) return;
 	if (!video.sws || video.sws_w != fr->width || video.sws_h != fr->height
-		|| video.sws_fmt != fr->format) {
+		|| video.sws_fmt != fr->format || video.sws_tw != sw || video.sws_th != sh) {
 		if (video.sws) sws_freeContext(video.sws);
 		video.sws = sws_getContext(fr->width, fr->height, (AVPixelFormat)fr->format,
-			fr->width, fr->height, AV_PIX_FMT_BGRA, SWS_BILINEAR, NULL, NULL, NULL);
+			sw, sh, AV_PIX_FMT_BGRA, SWS_BILINEAR, NULL, NULL, NULL);
 		video.sws_w = fr->width; video.sws_h = fr->height; video.sws_fmt = fr->format;
+		video.sws_tw = sw; video.sws_th = sh;
 		if (!video.sws) return;
 	}
 	uint8_t *dst[4] = { video.dib, 0, 0, 0 };
-	int ls[4] = { fr->width * 4, 0, 0, 0 };
+	int ls[4] = { sw * 4, 0, 0, 0 };
 	sws_scale(video.sws, fr->data, fr->linesize, 0, fr->height, dst, ls);
 	video.have_new = TRUE; // a fresh frame is waiting for FF_VisRenderDC
 }
@@ -713,6 +736,13 @@ static DWORD WINAPI video_thread(LPVOID)
 	// Yielding to audio keeps the queue handoff from dragging the audio pump.
 	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
 	while (1) {
+		// vis hidden: no one is looking at the picture - skip the decode+scale
+		// work entirely and idle, so the decode thread contributes zero CPU and
+		// zero scheduling pressure on the audio pump while the vis is closed.
+		if (!video.vis_open && !video.seeking) {
+			Sleep(250);
+			continue;
+		}
 		video_tick();
 		// during a seek catch-up run at ~1kHz instead of 66Hz: the queued
 		// stale frames (keyframe -> target) are then dropped at decoder
@@ -772,6 +802,7 @@ static void video_detach()
 	video.vdec = 0; video.fmt = 0;
 	video.have_new = FALSE;
 	video.vis_blank = FALSE;
+	video.vis_open = FALSE; // the decode thread idles until the vis reopens
 	video.seeking = FALSE; // stop the fast catch-up cadence
 	LeaveCriticalSection(&video.lock);
 	EnterCriticalSection(&video.qlock);
@@ -1785,6 +1816,7 @@ static BOOL WINAPI FF_VisOpen(DWORD colors[3])
 	video_window_init(); // ensure the decoder thread is alive
 	EnterCriticalSection(&video.lock);
 	video.vis_blank = FALSE; // new track/vis session: refresh resumes
+	video.vis_open = TRUE;  // decode thread resumes (was idling when closed)
 	LeaveCriticalSection(&video.lock);
 	return TRUE;
 }
@@ -1792,6 +1824,9 @@ static BOOL WINAPI FF_VisOpen(DWORD colors[3])
 static void WINAPI FF_VisClose()
 {
 	logmsg("vis: close");
+	EnterCriticalSection(&video.lock);
+	video.vis_open = FALSE; // decode thread idles - no CPU while the vis is hidden
+	LeaveCriticalSection(&video.lock);
 }
 
 static void WINAPI FF_VisSize(HDC dc, SIZE *size)
