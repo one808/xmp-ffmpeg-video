@@ -980,11 +980,12 @@ static void d3d_present(void)
 		// texture is in the driver's present cycle - and BEFORE the first
 		// successful present that cycle never drains, so DONOTWAIT fails
 		// forever and the window gets no pixels (looks transparent). The
-		// waiting variant breaks the deadlock: it blocks at most ~1 frame,
-		// on this LOWEST-priority window thread, and never on the audio.
+		// blocking variant (flags=0; there is no D3DLOCK_WAIT in D3D9)
+		// breaks the deadlock: it waits out the cycle, at most ~1 frame,
+		// on this LOWEST-priority window thread - never on the audio.
 		HRESULT lh = d3tex->LockRect(0, &lr, 0, D3DLOCK_DONOTWAIT);
 		if (lh != D3D_OK)
-			lh = d3tex->LockRect(0, &lr, 0, D3DLOCK_WAIT);
+			lh = d3tex->LockRect(0, &lr, 0, 0);
 		if (lh != D3D_OK) {
 			static DWORD s_lock_log = 0;
 			DWORD now = GetTickCount();
