@@ -1068,10 +1068,10 @@ static int sa_open(FFMPEG *f)
 	sa_total = 0; sa_base = 0; sa_ur = 0;
 	AVChannelLayout cin, cout;
 	uint32_t mask_in = f->dec->ch_layout.nb_channels == 1
-		? AV_CHANNEL_FRONT_LEFT
-		: (AV_CHANNEL_FRONT_LEFT | AV_CHANNEL_FRONT_RIGHT);
+		? AV_CHAN_FRONT_LEFT
+		: (AV_CHAN_FRONT_LEFT | AV_CHAN_FRONT_RIGHT);
 	av_channel_layout_from_mask(&cin, mask_in);
-	av_channel_layout_from_mask(&cout, AV_CHANNEL_FRONT_LEFT | AV_CHANNEL_FRONT_RIGHT);
+	av_channel_layout_from_mask(&cout, AV_CHAN_FRONT_LEFT | AV_CHAN_FRONT_RIGHT);
 	if (swr_alloc_set_opts2(&sa_swr, &cout, AV_SAMPLE_FMT_S16, sa_rate,
 		&cin, AV_SAMPLE_FMT_FLT, f->dec->sample_rate, 0, NULL) < 0 ||
 		swr_init(sa_swr) < 0) {
