@@ -34,10 +34,13 @@ if [[ ! -f $PREFIX/lib/libSDL2.a ]]; then
 	tar -C "$SRC/sdl2-mingw-extract" -xf "$TARBALL"
 	DIR="$SRC/sdl2-mingw-extract"
 	# the archive's top-level folder name varies - locate the 32-bit (i686)
-	# static library + headers wherever they are (NOT the x86_64 ones)
-	A=$(find "$DIR" \( -name "SDL2.a" -o -name "libSDL2.a" \) | grep -E "/i[56]86/" | head -1)
+	# static library + headers wherever they are (NOT the x86_64 ones).
+	# NOTE: the dir is "i686-w64-mingw32" (dash, not slash) - match without
+	# a trailing slash, and make the find|grep|head pipeline explicit so a
+	# no-match is a clean error under `set -euo pipefail`.
+	A=$(find "$DIR" \( -name "SDL2.a" -o -name "libSDL2.a" \) | grep -E "/i[56]86" || true)
 	[[ -n $A ]] || { echo "ERROR: 32-bit SDL2 static lib not found in the mingw package" >&2; find "$DIR" -name "*.a" | sed 's/^/    /' >&2; exit 1; }
-	H=$(find "$DIR" -name "SDL.h" -path "*/include/SDL2/SDL.h" | grep -E "/i[56]86/" | head -1)
+	H=$(find "$DIR" -name "SDL.h" -path "*/include/SDL2/SDL.h" | grep -E "/i[56]86" || true)
 	[[ -n $H ]] || { echo "ERROR: 32-bit SDL.h not found in the mingw package" >&2; find "$DIR" -name "SDL.h" | sed 's/^/    /' >&2; exit 1; }
 	cp "$A" "$PREFIX/lib/libSDL2.a"
 	rm -rf "$PREFIX/include/SDL2"
