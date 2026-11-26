@@ -1938,7 +1938,6 @@ static BOOL WINAPI FF_VisRenderDC(HDC dc, SIZE size, DWORD flags)
 		LeaveCriticalSection(&video.lock);
 		return FALSE;
 	}
-	FillRect(dc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
 	if (video.dibw >= 1 && video.dibh >= 1) {
 		double sar = 1.0;
 		AVRational fsar = video.frame_sar;
@@ -1951,12 +1950,25 @@ static BOOL WINAPI FF_VisRenderDC(HDC dc, SIZE size, DWORD flags)
 		else          { w = size.cx; h = (int)(w / va + 0.5); x = 0; y = (size.cy - h) / 2; }
 		if (w < 1) w = 1;
 		if (h < 1) h = 1;
-		// smooth (filtered) scaling - the default GDI stretch jaggies badly,
-		// especially when shrinking the video into a small vis area
-		int oldmode = SetStretchBltMode(dc, HALFTONE);
-		StretchDIBits(dc, x, y, w, h, 0, 0, video.dibw, video.dibh,
-			video.dib, &video.bmi, DIB_RGB_COLORS, SRCCOPY);
-		SetStretchBltMode(dc, oldmode);
+		// GDI cost on XMPlay's UI thread is what chokes the audio - the mode-3
+		// bisection proved that skipping this blit clears the sustained chop.
+		// So keep the blit as cheap as possible:
+		if (x != 0 || y != 0)
+			FillRect(dc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH)); // letterbox bars
+		if (w == video.dibw && h == video.dibh) {
+			// exact 1:1 fit (the default: the vis is suggested at the DIB size) -
+			// no GDI scaling at all, just one cheap direct blit
+			SetDIBitsToDevice(dc, x, y, w, h, 0, 0, 0, 0,
+				video.dib, &video.bmi, DIB_RGB_COLORS);
+		} else {
+			// only when the vis is resized/fullscreened past the DIB: a FAST
+			// nearest-neighbour stretch, not HALFTONE (the dithered bilinear we
+			// used before - the slowest GDI stretch mode)
+			int oldmode = SetStretchBltMode(dc, STRETCHNEARESTNEIGHBOR);
+			StretchDIBits(dc, x, y, w, h, 0, 0, video.dibw, video.dibh,
+				video.dib, &video.bmi, DIB_RGB_COLORS, SRCCOPY);
+			SetStretchBltMode(dc, oldmode);
+		}
 	}
 	video.have_new = FALSE;
 	LeaveCriticalSection(&video.lock);
