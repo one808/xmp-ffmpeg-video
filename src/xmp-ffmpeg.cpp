@@ -981,7 +981,7 @@ static void d3d_present(void)
 	// the legacy d3d9.h lacks D3DBACKBUFFER_TYPE_DEFAULT / the D3DTS_/D3DTOP_/
 	// D3DTEXF_ enums: use the raw values (D3DBACKBUFFER_TYPE_BACK=1,
 	// D3DTS_TEXTUREOP=0/D3DTS_TFACTORY=1, D3DTOP_SELECTARG=1, D3DTEXF_TEXTURE=0)
-	if (d3dev->GetBackBuffer(0, 0, 1 /*BACK*/, &bb) != D3D_OK) return;
+	if (d3dev->GetBackBuffer(0, 0, (D3DBACKBUFFER_TYPE)1 /*BACK*/, &bb) != D3D_OK) return;
 	d3dev->SetRenderTarget(0, bb);
 	{
 		D3DVIEWPORT9 vp = { 0, 0, (UINT)cw, (UINT)ch, 0.0f, 1.0f };
@@ -990,8 +990,8 @@ static void d3d_present(void)
 	d3dev->BeginScene();
 	d3dev->Clear(0, 0, D3DCLEAR_TARGET, 0xFF000000, -1.0f, 0);
 	d3dev->SetTexture(0, d3tex);
-	d3dev->SetTextureStageState(0, 0 /*D3DTS_TEXTUREOP*/, 1 /*D3DTOP_SELECTARG*/);
-	d3dev->SetTextureStageState(0, 1 /*D3DTS_TFACTORY*/, 0 /*D3DTEXF_TEXTURE*/);
+	d3dev->SetTextureStageState(0, (D3DTEXTURESTAGESTATETYPE)0 /*TEXTUREOP*/, 1 /*SELECTARG*/);
+	d3dev->SetTextureStageState(0, (D3DTEXTURESTAGESTATETYPE)1 /*TFACTORY*/, 0 /*TEXF_TEXTURE*/);
 	// legacy header lacks D3DFVF_XYZRHW1: it is D3DFVF_XYZRHW plus a 32-bit
 	// render-height flag
 	d3dev->SetFVF(D3DFVF_XYZRHW | 0x20 /*32-bit RH*/);
