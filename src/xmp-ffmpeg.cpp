@@ -70,6 +70,10 @@ static DWORD vis_colors[3];        // skin colors from FF_VisOpen (bg,text1,text
 //   2 = play as audio-only (no video attach; LRC lyrics show instead)
 //   3 = decode runs, but the GDI blit to the vis area is skipped (picture
 //       not shown) - isolates the GDI render from the decode CPU
+//   4 = DIAG: own window shown, presents throttled to ~1fps (isolates the
+//       PRESENT RATE from the audio chop)
+//   5 = DIAG: own window shown, only the FIRST frame is presented (isolates
+//       window existence from per-frame present activity)
 // Used to isolate which part of the video path chokes the audio on video tracks.
 static int g_video_mode = 0;
 
@@ -174,6 +178,8 @@ struct VIDEO {
 	volatile BOOL hidden;       // user hid it (ESC) - decode idles
 	int show_w, show_h;         // default window size (native video, clamped)
 	BOOL size_set;              // default size applied once, never fought afterwards
+	long present_throttle_ms;   // diagnostic modes 4/5: cap the present rate (0 = full fps)
+	DWORD last_present_ms;      // GetTickCount() when the last present ran
 	// playback clock: captured on XMPlay's thread, interpolated here. The
 	// render thread must NEVER call XMPlay functions (deadlock risk).
 	double clock_base;
@@ -769,10 +775,12 @@ static void video_tick()
 		if (!s_last) s_last = nowt;
 		if (nowt - s_last >= 1000) {
 			s_last = nowt;
-			logmsg("vt: q=%d starved=%d dropped=%d last_shown=%.2f clock=%.2f busy=%lums max=%lums",
-				qnow, s_starved, s_dropped, s_shown_pts, t, s_busy, s_maxtick);
+			logmsg("vt: q=%d starved=%d dropped=%d last_shown=%.2f clock=%.2f busy=%lums max=%lums pr=%ld prw=%ldus",
+				qnow, s_starved, s_dropped, s_shown_pts, t, s_busy, s_maxtick,
+				g_pr_count, g_pr_worst_us);
 			s_starved = s_dropped = 0;
 			s_busy = 0; s_maxtick = 0;
+			g_pr_count = 0; g_pr_worst_us = 0;
 		}
 	}
 }
@@ -859,6 +867,20 @@ static IDirect3DDevice9 *d3dev = 0;
 static IDirect3DTexture9 *d3tex = 0;
 static int d3tex_w = 0, d3tex_h = 0;
 static D3DPRESENT_PARAMETERS d3pp;
+// present/paint latency stats, written by the window thread, reported (and
+// reset) by the decode thread's vt: heartbeat: pr= count, prw= worst us.
+static LARGE_INTEGER g_prqf;
+static volatile long g_pr_worst_us;
+static volatile long g_pr_count;
+static void pr_stat(LARGE_INTEGER p0, LARGE_INTEGER p1)
+{
+	g_pr_count++;
+	if (g_prqf.QuadPart) {
+		long us = (long)((double)(p1.QuadPart - p0.QuadPart) * 1000000.0
+			/ (double)g_prqf.QuadPart);
+		if (us > g_pr_worst_us) g_pr_worst_us = us;
+	}
+}
 
 static void d3d_release(void)
 {
@@ -882,20 +904,16 @@ static BOOL d3d_init(HWND hwnd)
 	memset(&d3pp, 0, sizeof d3pp);
 	d3pp.Windowed = TRUE;
 	d3pp.hDeviceWindow = hwnd;
-	d3pp.SwapEffect = D3DSWAPEFFECT_FLIP;
-	d3pp.EnableAutoReset = TRUE;
+	// COPY is the universally-supported windowed swap effect: FLIP is a
+	// fullscreen-only effect on most drivers and a windowed FLIP device
+	// creation silently fails - which would drop us onto the GDI fallback
+	// (and the GDI lock is exactly what we are trying to avoid).
+	d3pp.SwapEffect = D3DSWAPEFFECT_COPY;
 	d3pp.BackBufferCount = 1;
-	// pick a supported windowed back-buffer format
-	BOOL have = FALSE;
-	UINT n = d3d->GetAdapterFormatCount(0);
-	for (UINT i = 0; i < n; i++) {
-		D3DFORMAT fmt;
-		if (d3d->GetAdapterFormat(0, i, &fmt) == D3D_OK &&
-			(fmt == D3DFMT_X8R8G8B8 || fmt == D3DFMT_A8R8G8B8)) {
-			d3pp.BackBufferFormat = fmt; have = TRUE; break;
-		}
-	}
-	if (!have) d3pp.BackBufferFormat = D3DFMT_X8R8G8B8;
+	// windowed back-buffer format. The legacy d3d9.h in this toolchain lacks the
+	// GetAdapterFormat/GetAdapterFormatCount query methods, and X8R8G8B8 windowed
+	// is universally supported, so set it directly.
+	d3pp.BackBufferFormat = D3DFMT_X8R8G8B8;
 	if (d3d->CreateDevice(0, D3DDEVTYPE_HAL, hwnd,
 		D3DCREATE_SOFTWARE_VERTEXPROCESSING, &d3pp, &d3dev) != D3D_OK) {
 		d3d_release();
@@ -1100,7 +1118,13 @@ static LRESULT CALLBACK video_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 	case WM_PAINT: {
 		PAINTSTRUCT ps;
 		HDC dc = BeginPaint(hwnd, &ps);
-		if (!d3dev) video_paint(dc); // GDI paint only when D3D is unavailable
+		if (!d3dev) { // GDI paint only when D3D is unavailable
+			LARGE_INTEGER p0, p1;
+			QueryPerformanceCounter(&p0);
+			video_paint(dc);
+			QueryPerformanceCounter(&p1);
+			pr_stat(p0, p1);
+		}
 		EndPaint(hwnd, &ps);
 		return 0;
 	}
@@ -1135,8 +1159,20 @@ static LRESULT CALLBACK video_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 		video_blank();
 		return 0;
 	case WM_APP_VPRESENT:
-		if (d3dev) d3d_present();          // GPU blit - no GDI lock, audio stays smooth
-		else InvalidateRect(hwnd, 0, FALSE); // GDI fallback repaint
+		// diagnostic present throttle (VideoMode 4/5): cap how often the
+		// picture is presented - isolates the PRESENT RATE from the audio
+		if (video.present_throttle_ms &&
+			(GetTickCount() - video.last_present_ms) < (DWORD)video.present_throttle_ms)
+			return 0;
+		video.last_present_ms = GetTickCount();
+		if (d3dev) { // GPU blit - no GDI lock, audio stays smooth
+			LARGE_INTEGER p0, p1;
+			QueryPerformanceCounter(&p0);
+			d3d_present();
+			QueryPerformanceCounter(&p1);
+			pr_stat(p0, p1);
+		}
+		else InvalidateRect(hwnd, 0, FALSE); // GDI fallback: measured in WM_PAINT
 		return 0;
 	case WM_SIZE:
 		InvalidateRect(hwnd, 0, FALSE);
@@ -1151,6 +1187,7 @@ static LRESULT CALLBACK video_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 static DWORD WINAPI video_wnd_thread(LPVOID)
 {
 	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+	QueryPerformanceFrequency(&g_prqf);
 	WNDCLASSEX wc;
 	memset(&wc, 0, sizeof wc);
 	wc.cbSize = sizeof wc;
@@ -1169,6 +1206,7 @@ static DWORD WINAPI video_wnd_thread(LPVOID)
 	if (!h) return 1;
 	video.hwnd = h;
 	d3d_init(h); // prefer GPU rendering; on failure we fall back to GDI paint
+	logmsg("cb: window render=%s", d3dev ? "d3d" : "gdi");
 	if (video.active)
 		PostMessage(h, WM_APP_VSHOW, 0, 0); // a track is attached but our VSHOW
 	                                          // may have been lost before we existed
@@ -1267,6 +1305,10 @@ static void video_attach(FFMPEG *f)
 	video.have_new = FALSE;
 	video.vis_blank = FALSE;
 	video.seeking = FALSE; // fresh track: not in a seek catch-up
+	// diagnostic present throttle (VideoMode 4 = ~1fps, 5 = once)
+	video.present_throttle_ms = (g_video_mode == 4) ? 1000 :
+		(g_video_mode == 5) ? 0x7FFFFFFF : 0;
+	video.last_present_ms = 0;
 	video.active = TRUE;
 	LeaveCriticalSection(&video.lock);
 	video_window_init(); // ensure the decode + window threads are alive
@@ -2465,7 +2507,7 @@ static DWORD WINAPI FF_Open(const char *filename, XMPFILE file)
 	// read the bisection switch each open so it can be flipped without a rebuild
 	{ int vm = 0;
 	  if (xmpfreg && xmpfreg->GetInt(LRC_REGSEC, "VideoMode", &vm))
-		  g_video_mode = (vm >= 0 && vm <= 3) ? vm : 0;
+		  g_video_mode = (vm >= 0 && vm <= 5) ? vm : 0;
 	  else g_video_mode = 0;
 	  logmsg("cb: VideoMode=%d", g_video_mode); }
 	if (g_video_mode != 2)
