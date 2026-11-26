@@ -1964,7 +1964,11 @@ static BOOL WINAPI FF_VisRenderDC(HDC dc, SIZE size, DWORD flags)
 			// only when the vis is resized/fullscreened past the DIB: a FAST
 			// nearest-neighbour stretch, not HALFTONE (the dithered bilinear we
 			// used before - the slowest GDI stretch mode)
-			int oldmode = SetStretchBltMode(dc, STRETCHNEARESTNEIGHBOR);
+			// STRETCH_NEARESTNEIGHBOR = 7 (fast, no dither). The value is used
+			// directly: this XP-era mingw toolchain names the stretch-mode
+			// constants inconsistently (HALFTONE compiled bare), so a literal
+			// avoids a header-dependent constant that could be undeclared.
+			int oldmode = SetStretchBltMode(dc, 7 /* STRETCH_NEARESTNEIGHBOR */);
 			StretchDIBits(dc, x, y, w, h, 0, 0, video.dibw, video.dibh,
 				video.dib, &video.bmi, DIB_RGB_COLORS, SRCCOPY);
 			SetStretchBltMode(dc, oldmode);
