@@ -29,14 +29,16 @@ if [[ ! -f $PREFIX/lib/libSDL2.a ]]; then
 	# guard: a broken download is not gzip
 	head -c2 "$TARBALL" | od -An -tx1 | grep -q "1f 8b" || \
 		{ echo "ERROR: SDL2 tarball is not gzip (download failed?)" >&2; exit 1; }
-	rm -rf "$SRC/SDL2-devel-$SDLVER-mingw"
-	tar -C "$SRC" -xf "$TARBALL"
-	DIR="$SRC/SDL2-devel-$SDLVER-mingw"
-	# locate the x86 (32-bit) static library + headers
-	A=$(find "$DIR" -path "*/x86/*" -name "SDL2.a" | head -1)
-	[[ -n $A ]] || { echo "ERROR: x86 SDL2.a not found in the mingw package" >&2; find "$DIR" -name "*.a" | sed 's/^/    /' >&2; exit 1; }
-	H=$(find "$DIR" -path "*/x86/*" -name "SDL.h" | head -1)
-	[[ -n $H ]] || { echo "ERROR: SDL.h not found in the mingw package" >&2; exit 1; }
+	rm -rf "$SRC/sdl2-mingw-extract"
+	mkdir -p "$SRC/sdl2-mingw-extract"
+	tar -C "$SRC/sdl2-mingw-extract" -xf "$TARBALL"
+	DIR="$SRC/sdl2-mingw-extract"
+	# the archive's top-level folder name varies - locate the 32-bit (i686)
+	# static library + headers wherever they are (NOT the x86_64 ones)
+	A=$(find "$DIR" \( -name "SDL2.a" -o -name "libSDL2.a" \) | grep -E "/i[56]86/" | head -1)
+	[[ -n $A ]] || { echo "ERROR: 32-bit SDL2 static lib not found in the mingw package" >&2; find "$DIR" -name "*.a" | sed 's/^/    /' >&2; exit 1; }
+	H=$(find "$DIR" -name "SDL.h" -path "*/include/SDL2/SDL.h" | grep -E "/i[56]86/" | head -1)
+	[[ -n $H ]] || { echo "ERROR: 32-bit SDL.h not found in the mingw package" >&2; find "$DIR" -name "SDL.h" | sed 's/^/    /' >&2; exit 1; }
 	cp "$A" "$PREFIX/lib/libSDL2.a"
 	rm -rf "$PREFIX/include/SDL2"
 	cp -r "$(dirname "$H")" "$PREFIX/include/SDL2"

@@ -44,7 +44,8 @@ test -f "$SDL2A" || { echo "ERROR: $SDL2A missing (run scripts/build-sdl2.sh fir
 # libgcc_s_*.dll - everything goes into this single DLL.
 $TRIPLE-g++ -shared -o build/xmp-ffmpeg.dll build/xmp-ffmpeg.o build/xmp-ffmpeg-res.o \
 	-Wl,--kill-at -static-libstdc++ -static-libgcc $FFLIBS \
-	"$SDL2A" -ld3d9 -lversion -lssp -latomic -lgdi32 -luser32 -lws2_32
+	"$SDL2A" -ld3d9 -lversion -limm32 -lshell32 -lshlwapi \
+	-lssp -latomic -lgdi32 -luser32 -lws2_32
 
 # sanity: the VERSIONINFO resource must be embedded (XMPlay reads it).
 # Binary UTF-16-aware check - `strings` misses short versions like "1.1"
