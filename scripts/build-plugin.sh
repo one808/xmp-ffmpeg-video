@@ -37,6 +37,9 @@ FFLIBS=$(pkg-config --static --libs libavformat libavcodec libswresample libswsc
 echo "link libs: $FFLIBS"
 # SDL2 (static, video+render only) - the video window's renderer. Its D3D9
 # backend pulls in -ld3d9; -lversion is used by SDL's Windows video driver.
+# The prebuilt SDL2.a also pulls in SDL's Windows audio/joystick/haptic/
+# sensor/timer driver objects (SDL_INIT_VIDEO inits the joystick+sensor
+# subsystems), so the full system dependency set from libSDL2.la is linked.
 SDL2A="$PREFIX/lib/libSDL2.a"
 test -f "$SDL2A" || { echo "ERROR: $SDL2A missing (run scripts/build-sdl2.sh first)"; exit 1; }
 # g++ driver + -static-libstdc++/-static-libgcc: the dep .pc files pull in
@@ -45,6 +48,7 @@ test -f "$SDL2A" || { echo "ERROR: $SDL2A missing (run scripts/build-sdl2.sh fir
 $TRIPLE-g++ -shared -o build/xmp-ffmpeg.dll build/xmp-ffmpeg.o build/xmp-ffmpeg-res.o \
 	-Wl,--kill-at -static-libstdc++ -static-libgcc $FFLIBS \
 	"$SDL2A" -ld3d9 -lversion -limm32 -lshell32 -lshlwapi \
+	-lwinmm -lole32 -loleaut32 -lsetupapi -ldinput8 -ldxguid \
 	-lssp -latomic -lgdi32 -luser32 -lws2_32
 
 # sanity: the VERSIONINFO resource must be embedded (XMPlay reads it).
