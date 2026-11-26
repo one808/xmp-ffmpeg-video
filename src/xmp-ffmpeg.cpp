@@ -622,6 +622,17 @@ static void video_tick()
 	int budget = 8; // max decode/feed iterations this tick
 	int nstarve = 0, ndrop = 0;
 	double shown_pts = -1;
+	// per-tick CPU: how many ms this tick's decode+scale actually took, so the
+	// vt: heartbeat can report the decode thread's real load (busy total + the
+	// worst single tick per second). Answers "is the audio chop the decode
+	// thread's CPU, or something else?"
+	static LARGE_INTEGER s_qf = {0};
+	if (s_qf.QuadPart == 0) {
+		if (!QueryPerformanceFrequency(&s_qf) || s_qf.QuadPart == 0)
+			s_qf.QuadPart = 10000000; // fallback: 10MHz
+	}
+	LARGE_INTEGER q0; QueryPerformanceCounter(&q0);
+	unsigned long work_ms = 0;
 	// The heavy avcodec decode + sws_scale now run OUTSIDE the display lock:
 	// only the packet pop takes the fast queue lock, and only the dib/flag
 	// bookkeeping takes video.lock. So the audio thread's video_enqueue
@@ -705,25 +716,34 @@ static void video_tick()
 		LeaveCriticalSection(&video.lock);
 		break; // one present per tick is enough
 	}
+	{ // per-tick CPU: how long this tick's decode+scale took
+		LARGE_INTEGER q1; QueryPerformanceCounter(&q1);
+		work_ms = (unsigned long)(((double)(q1.QuadPart - q0.QuadPart) * 1000.0) / (double)s_qf.QuadPart);
+	}
 	EnterCriticalSection(&video.qlock);
 	int qnow = video.qcount;
 	LeaveCriticalSection(&video.qlock);
 	// 1/sec diagnostic heartbeat: queue depth + per-second starvation/drop
-	// counts, used to diagnose the post-seek judder (%TEMP%\xmp-ffmpeg-video.log)
+	// counts + decode-thread CPU (busy total + worst single tick), used to
+	// diagnose the post-seek judder and the audio chop (%TEMP%\xmp-ffmpeg-video.log)
 	{
 		static int s_starved = 0, s_dropped = 0;
+		static unsigned long s_busy = 0, s_maxtick = 0;
 		static double s_shown_pts = -1;
 		if (shown_pts > 0) s_shown_pts = shown_pts;
 		s_starved += nstarve;
 		s_dropped += ndrop;
+		s_busy += work_ms;
+		if (work_ms > s_maxtick) s_maxtick = work_ms;
 		DWORD nowt = GetTickCount();
 		static DWORD s_last = 0;
 		if (!s_last) s_last = nowt;
 		if (nowt - s_last >= 1000) {
 			s_last = nowt;
-			logmsg("vt: q=%d starved=%d dropped=%d last_shown=%.2f clock=%.2f",
-				qnow, s_starved, s_dropped, s_shown_pts, t);
+			logmsg("vt: q=%d starved=%d dropped=%d last_shown=%.2f clock=%.2f busy=%lums max=%lums",
+				qnow, s_starved, s_dropped, s_shown_pts, t, s_busy, s_maxtick);
 			s_starved = s_dropped = 0;
+			s_busy = 0; s_maxtick = 0;
 		}
 	}
 }
