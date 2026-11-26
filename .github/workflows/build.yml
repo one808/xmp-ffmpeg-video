@@ -72,6 +72,13 @@ jobs:
           VER=$(tr -d ' \n' < VERSION)
           echo "ver=$VER" >> "$GITHUB_OUTPUT"
 
+      - name: Package branch source
+        if: success()
+        run: |
+          # keep a copy of this branch's source (at the exact built commit) in the
+          # artifact; the branch name becomes the zip's top-level folder
+          git archive --format=zip --prefix="${GITHUB_REF_NAME}/" HEAD -o "branch-source.zip"
+
       - name: Upload plugin
         uses: actions/upload-artifact@v4
         with:
@@ -80,6 +87,7 @@ jobs:
           path: |
             build/xmp-ffmpeg.dll
             README.md
+            branch-source.zip
           retention-days: 30
 
       - name: Publish GitHub Release (add-only, never touches old releases)
