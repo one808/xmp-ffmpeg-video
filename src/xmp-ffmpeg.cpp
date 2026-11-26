@@ -756,12 +756,14 @@ static DWORD WINAPI video_thread(LPVOID)
 {
 	// B2: no window of our own - just keep the latest frame decoded into
 	// video.dib; XMPlay's vis area shows it via FF_VisRenderDC.
-	// Run below the audio pump: video_tick holds video.lock across its
-	// decode+scale work, and the audio thread's video_enqueue blocks on that
-	// lock. At equal priority the heavy video tick starves the audio pump and
-	// shows up as "video track -> constant mild audio choppiness" (underrun).
-	// Yielding to audio keeps the queue handoff from dragging the audio pump.
-	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+	// The decode thread's periodic CPU bursts (h264 decode + sws, measured
+	// ~5-18ms every ~40ms at 25fps => 5-12% of a core) jitter XMPlay's audio
+	// path: the plugin's own audio pump stays clean (pb: ur=0), but the sound
+	// card DMA / mixer downstream is starved by the decode ticks. Run it at
+	// the LOWEST foreground priority so its bursts always yield to audio work
+	// and can never delay the audio thread. The deep video queue (VQ_TARGET)
+	// absorbs the occasional dropped tick, so the picture stays in sync.
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
 	while (1) {
 		// vis hidden: no one is looking at the picture - skip the decode+scale
 		// work entirely and idle, so the decode thread contributes zero CPU and
