@@ -408,6 +408,13 @@ static FFMPEG *InitFF(const char *filename, XMPFILE file)
 			const AVCodec *c = avcodec_find_decoder(st->codecpar->codec_id);
 			if (c) {
 				f->vdec = avcodec_alloc_context3(c);
+				if (f->vdec) {
+					// single-threaded video decode: FFmpeg's frame-threading worker
+					// pool (N threads waking per frame + atomic sync) is a classic
+					// source of audio-pump jitter. One decode thread is slower per
+					// frame but far less invasive on the scheduler - audio stays smooth.
+					f->vdec->thread_count = 1;
+				}
 				if (f->vdec && avcodec_parameters_to_context(f->vdec, st->codecpar) >= 0
 					&& avcodec_open2(f->vdec, c, NULL) >= 0) {
 					f->vstream = vs;
@@ -744,11 +751,21 @@ static DWORD WINAPI video_thread(LPVOID)
 			continue;
 		}
 		video_tick();
-		// during a seek catch-up run at ~1kHz instead of 66Hz: the queued
-		// stale frames (keyframe -> target) are then dropped at decoder
-		// speed, so a local seek shows the target in ~0.1-0.3s instead of
-		// churning through them at the 15ms cadence (~2s).
-		Sleep(video.seeking ? 1 : 15);
+		// tick cadence: during a seek catch-up run at ~1kHz so the queued stale
+		// frames (keyframe -> target) are dropped at decoder speed (a local seek
+		// shows the target in ~0.1-0.3s instead of ~2s). In normal playback tick
+		// at the VIDEO'S OWN frame rate, not a fixed 66Hz: we never poll faster
+		// than the stream has new frames, and fewer periodic wakeups means less
+		// scheduler churn on the audio pump.
+		DWORD sl;
+		if (video.seeking) sl = 1;
+		else {
+			int fd = (int)(video.frame_dur * 1000.0 + 0.5); // ms per frame
+			if (fd < 15) fd = 15;    // cap the poll at ~66fps
+			if (fd > 100) fd = 100;  // safety floor on the tick interval
+			sl = (DWORD)fd;
+		}
+		Sleep(sl);
 	}
 	return 0;
 }
@@ -2150,6 +2167,7 @@ static void video_late_scan(FFMPEG *f)
 		if (!c) continue;
 		AVCodecContext *vdec = avcodec_alloc_context3(c);
 		if (!vdec) return;
+		vdec->thread_count = 1; // single-threaded decode (see the main open path)
 		if (avcodec_parameters_to_context(vdec, p) < 0 || avcodec_open2(vdec, c, NULL) < 0) {
 			avcodec_free_context(&vdec);
 			return;
