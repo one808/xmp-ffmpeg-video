@@ -24,7 +24,8 @@
 
 #include <winsock2.h>
 #include <windows.h>
-#include <wchar.h>
+#include <d3d9.h> // video window renders via D3D (bypasses GDI); d3d9.dll is
+#include <wchar.h>        // loaded dynamically, so no d3d9 import (XP audit clean)
 #include "xmpin.h"
 
 #ifndef CP_936 // GBK / Chinese Simplified code page (XP-safe, from winnls.h)
@@ -845,6 +846,146 @@ static void video_blank()
 	InvalidateRect(video.hwnd, 0, FALSE); // repaint on the window thread
 }
 
+// --------------------------------------------------------------- D3D renderer
+// The video is blitted with Direct3D, NOT GDI: per-frame GDI (StretchDIBits /
+// BitBlt) takes the global GDI lock and, on this machine, jitters the audio
+// path. D3D uploads the frame to a texture and presents it on the GPU - no GDI
+// lock, so the audio stays smooth. d3d9.dll is loaded DYNAMICALLY (never in
+// the import table) so the XP-compat audit stays clean; if D3D is unavailable
+// we fall back to the GDI paint (video_paint).
+static HMODULE d3d_mod = 0;
+static IDirect3D9 *d3d = 0;
+static IDirect3DDevice9 *d3dev = 0;
+static IDirect3DTexture9 *d3tex = 0;
+static int d3tex_w = 0, d3tex_h = 0;
+static D3DPRESENT_PARAMETERS d3pp;
+
+static void d3d_release(void)
+{
+	if (d3tex) { d3tex->Release(); d3tex = 0; }
+	if (d3dev) { d3dev->Release(); d3dev = 0; }
+	if (d3d)   { d3d->Release(); d3d = 0; }
+	if (d3d_mod) { FreeLibrary(d3d_mod); d3d_mod = 0; }
+}
+
+static BOOL d3d_init(HWND hwnd)
+{
+	if (d3dev) return TRUE;
+	d3d_mod = LoadLibraryA("d3d9.dll");
+	if (!d3d_mod) return FALSE;
+	typedef IDirect3D9 *(WINAPI *fnD3DCreate9_t)(UINT);
+	fnD3DCreate9_t pfn = (fnD3DCreate9_t)GetProcAddress(d3d_mod, "Direct3DCreate9");
+	if (!pfn) { d3d_release(); return FALSE; }
+	d3d = pfn(D3D_SDK_VERSION);
+	if (!d3d) { d3d_release(); return FALSE; }
+
+	memset(&d3pp, 0, sizeof d3pp);
+	d3pp.Windowed = TRUE;
+	d3pp.hDeviceWindow = hwnd;
+	d3pp.SwapEffect = D3DSWAPEFFECT_FLIP;
+	d3pp.EnableAutoReset = TRUE;
+	d3pp.BackBufferCount = 1;
+	// pick a supported windowed back-buffer format
+	BOOL have = FALSE;
+	UINT n = d3d->GetAdapterFormatCount(0);
+	for (UINT i = 0; i < n; i++) {
+		D3DFORMAT fmt;
+		if (d3d->GetAdapterFormat(0, i, &fmt) == D3D_OK &&
+			(fmt == D3DFMT_X8R8G8B8 || fmt == D3DFMT_A8R8G8B8)) {
+			d3pp.BackBufferFormat = fmt; have = TRUE; break;
+		}
+	}
+	if (!have) d3pp.BackBufferFormat = D3DFMT_X8R8G8B8;
+	if (d3d->CreateDevice(0, D3DDEVTYPE_HAL, hwnd,
+		D3DCREATE_SOFTWARE_VERTEXPROCESSING, &d3pp, &d3dev) != D3D_OK) {
+		d3d_release();
+		return FALSE;
+	}
+	return TRUE;
+}
+
+static BOOL d3d_ensure_tex(int w, int h)
+{
+	if (!d3dev) return FALSE;
+	if (d3tex && d3tex_w == w && d3tex_h == h) return TRUE;
+	if (d3tex) { d3tex->Release(); d3tex = 0; }
+	if (d3dev->CreateTexture(w, h, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &d3tex, 0) != D3D_OK)
+		return FALSE;
+	d3tex_w = w; d3tex_h = h;
+	return TRUE;
+}
+
+// upload the current DIB (BGRA, top-down) to a texture and present it, letter-
+// boxed into the window. Runs on the window thread (from WM_APP_VPRESENT).
+static void d3d_present(void)
+{
+	if (!d3dev || !video.dib || video.dibw < 1 || !video.dibh) return;
+
+	// a display / resolution change loses the device: reset it (the texture
+	// dies with the device and is recreated on demand)
+	HRESULT tl = d3dev->TestCooperativeLevel();
+	if (tl == D3DERR_DEVICELOST || tl == D3DERR_DEVICENOTRESET) {
+		if (d3dev->Reset(&d3pp) != D3D_OK) return;
+		if (d3tex) { d3tex->Release(); d3tex = 0; }
+	}
+	if (!d3d_ensure_tex(video.dibw, video.dibh)) return;
+
+	{ // copy the DIB into the texture (row by row; the pitch may differ)
+		D3DLOCKED_RECT lr;
+		if (d3tex->LockRect(0, &lr, 0, D3DLOCK_NO_WAIT) != D3D_OK) return;
+		int w = video.dibw, h = video.dibh;
+		const BYTE *src = video.dib;
+		BYTE *dst = (BYTE*)lr.pBits;
+		for (int y = 0; y < h; y++)
+			memcpy(dst + (size_t)y * lr.Pitch, src + (size_t)y * w * 4, (size_t)w * 4);
+		d3tex->UnlockRect(0);
+	}
+
+	// letterbox the video into the window client, in NDC
+	int cw, ch;
+	{ RECT rc; GetClientRect(video.hwnd, &rc); cw = rc.right; ch = rc.bottom; }
+	if (cw < 1 || ch < 1) return;
+	double sar = 1.0;
+	AVRational fsar = video.frame_sar;
+	if (fsar.num <= 0 || fsar.den <= 0) fsar = video.sar;
+	if (fsar.num > 0 && fsar.den > 0) sar = (double)fsar.num / fsar.den;
+	double va = (double)video.dibw / video.dibh * sar, wa = (double)cw / ch;
+	int vw = cw, vh = ch, vx = 0, vy = 0;
+	if (wa > va) { vw = (int)(ch * va + 0.5); vx = (cw - vw) / 2; }
+	else          { vh = (int)(cw / va + 0.5); vy = (ch - vh) / 2; }
+	float L = (float)(2.0 * vx / cw - 1.0);
+	float R = (float)(2.0 * (vx + vw) / cw - 1.0);
+	float T = (float)(1.0 - 2.0 * vy / ch);
+	float B = (float)(1.0 - 2.0 * (vy + vh) / ch);
+
+	IDirect3DSurface9 *bb = 0;
+	if (d3dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_DEFAULT, &bb) != D3D_OK) return;
+	d3dev->SetRenderTarget(0, bb);
+	{
+		D3DVIEWPORT9 vp = { 0, 0, (UINT)cw, (UINT)ch, 0.0f, 1.0f };
+		d3dev->SetViewport(&vp);
+	}
+	d3dev->BeginScene();
+	d3dev->Clear(0, 0, D3DCLEAR_TARGET, 0xFF000000, -1.0f, 0);
+	d3dev->SetTexture(0, d3tex);
+	d3dev->SetTextureStageState(0, D3DTG_TEXTUREOP, D3DTEXTUREOP_SELECTARG);
+	d3dev->SetTextureStageState(0, D3DTG_TFACTORY, D3DTEXF_TEXTURE);
+	d3dev->SetFVF(D3DFVF_XYZRHW1 | D3DFVF_TEX1);
+	{
+		struct V { float x, y, z, rh; float u, v; };
+		V q[4] = {
+			{ L, T, 0, 1, 0, 0 },
+			{ R, T, 0, 1, 1, 0 },
+			{ L, B, 0, 1, 0, 1 },
+			{ R, B, 0, 1, 1, 1 },
+		};
+		d3dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, q, sizeof(V));
+	}
+	d3dev->EndScene();
+	d3dev->Present(0, 0, 0, 0);
+	if (bb) bb->Release();
+}
+
 // find XMPlay's main top-level window (the video window's owner so it follows
 // the player in z-order). Prefer the foreground window when it's ours; else
 // the first visible top-level window in our process without an owner.
@@ -959,7 +1100,7 @@ static LRESULT CALLBACK video_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 	case WM_PAINT: {
 		PAINTSTRUCT ps;
 		HDC dc = BeginPaint(hwnd, &ps);
-		video_paint(dc);
+		if (!d3dev) video_paint(dc); // GDI paint only when D3D is unavailable
 		EndPaint(hwnd, &ps);
 		return 0;
 	}
@@ -994,7 +1135,8 @@ static LRESULT CALLBACK video_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 		video_blank();
 		return 0;
 	case WM_APP_VPRESENT:
-		InvalidateRect(hwnd, 0, FALSE); // a fresh frame: repaint on this thread
+		if (d3dev) d3d_present();          // GPU blit - no GDI lock, audio stays smooth
+		else InvalidateRect(hwnd, 0, FALSE); // GDI fallback repaint
 		return 0;
 	case WM_SIZE:
 		InvalidateRect(hwnd, 0, FALSE);
@@ -1026,6 +1168,7 @@ static DWORD WINAPI video_wnd_thread(LPVOID)
 		CW_USEDEFAULT, CW_USEDEFAULT, 640, 480, 0, 0, wc.hInstance, 0);
 	if (!h) return 1;
 	video.hwnd = h;
+	d3d_init(h); // prefer GPU rendering; on failure we fall back to GDI paint
 	if (video.active)
 		PostMessage(h, WM_APP_VSHOW, 0, 0); // a track is attached but our VSHOW
 	                                          // may have been lost before we existed
