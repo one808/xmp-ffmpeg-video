@@ -59,6 +59,8 @@ static DWORD vis_colors[3];        // skin colors from FF_VisOpen (bg,text1,text
 // bisection switch ("FFmpeg video"/VideoMode in XMPlay's registry face):
 //   0 = full video (default)  1 = video attached but NO decode thread
 //   2 = play as audio-only (no video attach; LRC lyrics show instead)
+//   3 = decode runs, but the GDI blit to the vis area is skipped (picture
+//       not shown) - isolates the GDI render from the decode CPU
 // Used to isolate which part of the video path chokes the audio on video tracks.
 static int g_video_mode = 0;
 
@@ -1931,6 +1933,11 @@ static BOOL WINAPI FF_VisRenderDC(HDC dc, SIZE size, DWORD flags)
 
 	EnterCriticalSection(&video.lock);
 	if (!video.have_new) { LeaveCriticalSection(&video.lock); return FALSE; } // unchanged
+	if (g_video_mode == 3) { // bisection: decode runs, but no GDI blit to the vis
+		video.have_new = FALSE;
+		LeaveCriticalSection(&video.lock);
+		return FALSE;
+	}
 	FillRect(dc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
 	if (video.dibw >= 1 && video.dibh >= 1) {
 		double sar = 1.0;
@@ -2027,7 +2034,7 @@ static DWORD WINAPI FF_Open(const char *filename, XMPFILE file)
 	// read the bisection switch each open so it can be flipped without a rebuild
 	{ int vm = 0;
 	  if (xmpfreg && xmpfreg->GetInt(LRC_REGSEC, "VideoMode", &vm))
-		  g_video_mode = (vm >= 0 && vm <= 2) ? vm : 0;
+		  g_video_mode = (vm >= 0 && vm <= 3) ? vm : 0;
 	  else g_video_mode = 0;
 	  logmsg("cb: VideoMode=%d", g_video_mode); }
 	if (g_video_mode != 2)
