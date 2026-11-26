@@ -1069,8 +1069,9 @@ static int sa_open(FFMPEG *f)
 	}
 	sa_rate = want.freq; sa_ch = 2;
 	sa_bps = sa_rate * sa_ch * 2;
-	sa_target = (int)((double)sa_bps * 0.2 + 0.5); // 200ms of lead (echo is bounded to track/seek starts)
-	if (sa_target > 110 * 1024) sa_target = 110 * 1024;
+	sa_target = (int)((double)sa_bps * 1.0 + 0.5); // 1s of lead: survives the
+	                                               // long DPC stalls on this box
+	if (sa_target > 480 * 1024) sa_target = 480 * 1024;
 	sa_total = 0; sa_base = 0; sa_ur = 0;
 	AVChannelLayout cin, cout;
 	uint32_t mask_in = f->dec->ch_layout.nb_channels == 1
@@ -3410,10 +3411,10 @@ static DWORD WINAPI FF_Process(float *buffer, DWORD count)
 		// SDL audio: keep the device queue at sa_target bytes (the jitter
 		// buffer). Each Process call tops it up by decoding 26ms-ish chunks;
 		// in steady state the condition is false and the call is cheap. The
-		// AUDIBLE audio is this queue; the mixer gets silence below.
+		// AUDIBLE audio is this queue; the mixer gets silence at the bottom.
 		if (!f->eof && !f->sent_eof) {
 			int guard = 0;
-			while (!f->eof && !f->sent_eof && guard++ < 40 &&
+			while (!f->eof && !f->sent_eof && guard++ < 64 &&
 				(double)SDL_GetQueuedAudioSize(sa_dev) < (double)sa_target) {
 				if (f->outp < f->outlen) { // a chunk is staged: feed it
 					sa_feed(f, f->outlen / ch);
@@ -3425,18 +3426,7 @@ static DWORD WINAPI FF_Process(float *buffer, DWORD count)
 				if (decode_one(f) == 0) break; // stall: retry on the next call
 			}
 		}
-		if (f->eof)
-			return 0; // the track is really over: let the mixer SEE the end so
-			          // XMPlay advances to the next track
-		// XMPlay's mixer must receive a FULL buffer every call: a starving
-		// mixer is how XMPlay decides the track has ENDED (a zero return made
-		// it skip straight to the next track - v1.3 log). Silently filled, the
-		// track stays alive and the player's clock (progress/LRC) keeps running
-		// in real time while the SDL queue carries the actual audio.
-		memset(buffer, 0, (size_t)count * sizeof(float));
-		return count;
-	}
-
+	} else {
 	while (done < count) {
 		if (f->outp < f->outlen) { // staged samples available
 			DWORD n = count - done;
@@ -3449,6 +3439,7 @@ static DWORD WINAPI FF_Process(float *buffer, DWORD count)
 		}
 		if (f->eof) break;
 		if (decode_one(f) == 0) break;
+	}
 	}
 
 	// top the video queue up to VQ_TARGET. The demand loop above only reads
@@ -3533,7 +3524,19 @@ static DWORD WINAPI FF_Process(float *buffer, DWORD count)
 				(unsigned long)sa_ur);
 		}
 	}
-	return done; // the SDL-audio path already returned above (silence / EOF)
+	if (sa_dev) {
+		if (f->eof)
+			return 0; // the track is really over: let the mixer SEE the end so
+			          // XMPlay advances to the next track
+		// XMPlay's mixer must receive a FULL buffer every call: a starving
+		// mixer is how XMPlay decides the track has ENDED (a zero return made
+		// it skip straight to the next track - v1.3 log). Silently filled, the
+		// track stays alive and the player's clock (progress/LRC) keeps running
+		// in real time while the SDL queue carries the actual audio.
+		memset(buffer, 0, (size_t)count * sizeof(float));
+		return count;
+	}
+	return done; // mixer mode
 }
 
 static double WINAPI FF_GetGranularity()
