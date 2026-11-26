@@ -1040,6 +1040,11 @@ static double sa_now(void)
 static int sa_open(FFMPEG *f)
 {
 	if (sa_dev) return 1;
+	if (f->dec->ch_layout.nb_channels > 2) {
+		logmsg("dv: SDL audio: %d channels unsupported -> mixer",
+			f->dec->ch_layout.nb_channels);
+		return 0;
+	}
 	// WASAPI shared accepts these rates; anything else resamples to 48k
 	int devrate = 48000;
 	static const int ok[] = { 8000,11025,16000,22050,32000,44100,48000,88200,96000 };
@@ -1049,25 +1054,24 @@ static int sa_open(FFMPEG *f)
 	memset(&want, 0, sizeof want);
 	want.freq = devrate; want.format = AUDIO_S16LSB;
 	want.channels = 2; want.samples = 4096;
-	sa_dev = SDL_OpenAudioDevice(0, 0, &want, 4096, 0, 0);
+	// allowed_changes=0: SDL converts hardware differences internally and the
+	// queued format stays exactly `want`
+	sa_dev = SDL_OpenAudioDevice(0, 0, &want, &want, 0);
 	if (!sa_dev) {
 		logmsg("dv: SDL audio open failed: %s", SDL_GetError());
 		return 0;
 	}
-	SDL_AudioSpec have;
-	if (SDL_GetAudioDeviceSpec(sa_dev, &have) == 0) {
-		sa_rate = have.freq; sa_ch = have.channels;
-	} else {
-		sa_rate = want.freq; sa_ch = want.channels;
-	}
-	if (sa_ch > 2) sa_ch = 2;
+	sa_rate = want.freq; sa_ch = 2;
 	sa_bps = sa_rate * sa_ch * 2;
 	sa_target = (int)((double)sa_bps * 0.4 + 0.5); // 400ms of lead
-	if (sa_target > 110 * 1024) sa_target = 110 * 1024; // SDL's queue cap is 128KB
+	if (sa_target > 110 * 1024) sa_target = 110 * 1024;
 	sa_total = 0; sa_base = 0; sa_ur = 0;
 	AVChannelLayout cin, cout;
-	av_channel_layout_from_count(&cin, f->dec->ch_layout.nb_channels);
-	av_channel_layout_from_count(&cout, 2);
+	uint32_t mask_in = f->dec->ch_layout.nb_channels == 1
+		? AV_CHANNEL_FRONT_LEFT
+		: (AV_CHANNEL_FRONT_LEFT | AV_CHANNEL_FRONT_RIGHT);
+	av_channel_layout_from_mask(&cin, mask_in);
+	av_channel_layout_from_mask(&cout, AV_CHANNEL_FRONT_LEFT | AV_CHANNEL_FRONT_RIGHT);
 	if (swr_alloc_set_opts2(&sa_swr, &cout, AV_SAMPLE_FMT_S16, sa_rate,
 		&cin, AV_SAMPLE_FMT_FLT, f->dec->sample_rate, 0, NULL) < 0 ||
 		swr_init(sa_swr) < 0) {
@@ -1101,9 +1105,9 @@ static void sa_feed(FFMPEG *f, DWORD gotframes)
 		sacap = sabuf ? maxo * sa_ch * 2 + 1024 : 0;
 		if (!sabuf) return;
 	}
-	uint8_t *dst = sabuf;
-	int n = swr_convert(sa_swr, &dst, maxo, (const uint8_t*)f->outbuf,
-		(int)gotframes);
+	uint8_t *out[1] = { sabuf };
+	const uint8_t *in[1] = { (const uint8_t*)f->outbuf };
+	int n = swr_convert(sa_swr, out, maxo, in, (int)gotframes);
 	if (n > 0) {
 		SDL_QueueAudio(sa_dev, sabuf, n * sa_ch * 2);
 		sa_total += (long long)n * sa_ch * 2;
