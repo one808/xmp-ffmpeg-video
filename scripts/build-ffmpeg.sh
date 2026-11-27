@@ -45,7 +45,7 @@ fetch() { # fetch <url> <file>
 		sleep 3
 	done
 	echo "FAILED to download $1" >&2
-	exit 1
+	return 1
 }
 
 fetch_git() { # fetch_git <url> <dir> <commit>
@@ -61,8 +61,10 @@ fetch_git() { # fetch_git <url> <dir> <commit>
 if [[ ! -x $CROSS/bin/$TRIPLE-gcc ]]; then
 	log "building MinGW-w64 cross toolchain (GCC 10.4, win32 threads) - one-time, slow"
 	mkdir -p "$SANDBOX/cross_compilers"
-	# config.guess fetch workaround (savannah is flaky), same trick as build.sh upstream
-	fetch "http://git.savannah.gnu.org/gitweb/?p=config.git;a=blob_plain;f=config.guess;hb=HEAD" "$ROOT/config.guess" || true
+	# config.guess: use the vendored copy - the savannah gitweb link is flaky
+	# enough to kill the toolchain build. Refresh scripts/config.guess (GNU
+	# config.git HEAD) only if newer host detection is ever needed.
+	cp "$ROOT/scripts/config.guess" "$ROOT/config.guess"
 	mkdir -p "$ROOT/bin"
 	cat > "$ROOT/bin/wget" <<'WRAPPER'
 #!/usr/bin/env bash
@@ -72,10 +74,11 @@ for arg in "$@"; do
 	[[ $arg == -O ]] && NEXT=1 && continue
 	[[ -n ${NEXT:-} ]] && OUT=$arg && NEXT=
 done
-if [[ -n ${WANT:-} && -f /work-host/config.guess ]]; then cp /work-host/config.guess "$OUT"; exit 0; fi
+if [[ -n ${WANT:-} && -f ${XMP_CONFIG_GUESS:-/work-host/config.guess} ]]; then cp "${XMP_CONFIG_GUESS:-/work-host/config.guess}" "$OUT"; exit 0; fi
 exec /usr/bin/wget "$@"
 WRAPPER
 	chmod +x "$ROOT/bin/wget"
+	export XMP_CONFIG_GUESS="$ROOT/config.guess" # the wrapper serves this to the toolchain build
 	cp "$PATCHES/mingw-w64-build-r33" "$SANDBOX/cross_compilers/"
 	(
 		cd "$SANDBOX/cross_compilers"
