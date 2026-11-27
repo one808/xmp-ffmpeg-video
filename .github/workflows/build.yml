@@ -74,7 +74,10 @@ jobs:
       - name: Upload plugin
         uses: actions/upload-artifact@v4
         with:
-          name: xmp-ffmpeg-video-${{ steps.ver.outputs.ver }}
+          # run number in the name: same-named artifacts across runs are
+          # ambiguous (and blocked) - the number says exactly which build
+          # this DLL came from.
+          name: xmp-ffmpeg-video-${{ steps.ver.outputs.ver }}-${{ github.run_number }}
           path: |
             build/xmp-ffmpeg.dll
             README.md

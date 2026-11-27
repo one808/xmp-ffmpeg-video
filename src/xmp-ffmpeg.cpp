@@ -337,15 +337,11 @@ static char *BuildTags(FFMPEG *f)
 // without bound (positive feedback: more backlog -> more GC/thrash ->
 // slower consumer).
 //
-// Overflow policy: drop from the OLDEST side, but NEVER drop the keyframe
-// that sits at the head - it is the decoder's anchor. Throwing it away
-// (which the old one-shot drop did during transient post-seek backlog)
-// stalls the picture until the next keyframe = a hard freeze. The
-// consumer drains the backlog at real-time pace, so the anchor is only
-// protected against TRANSIENT spikes; under PERSISTENT overload the
-// keyframe gets decoded+freed anyway, after which the cap applies to the
-// ordinary packets. The hard ceiling (2x the soft cap) keeps memory
-// bounded even in pathological cases.
+// Overflow policy (see video_enqueue): the decoder's keyframe anchor is
+// never lost while it is still in the queue - dropping it (which happens
+// in post-seek catch-up bursts) stalls the picture until the next
+// keyframe = a hard freeze. Containers without KEY flags are left
+// untrimmed; a hard ceiling (2x the soft cap) still bounds memory.
 #define VQ_MAX 512
 
 static void video_drop_head() // frees the oldest packet; caller holds video.lock
@@ -367,10 +363,27 @@ static void video_enqueue(AVPacket *pkt)
 	n->next = 0;
 	n->pkt = pkt;
 	EnterCriticalSection(&video.lock);
-	while (video.qcount > VQ_MAX * 2) video_drop_head();              // hard ceiling
-	while (video.qcount > VQ_MAX
-		&& !(video.qhead && (video.qhead->pkt->flags & AV_PKT_FLAG_KEY)))
-		video_drop_head();                                             // keep the anchor
+	// hard ceiling: memory must stay bounded no matter what
+	while (video.qcount > VQ_MAX * 2) video_drop_head();
+	if (video.qcount > VQ_MAX) {
+		// soft cap: drop stale packets, but keep the NEWEST keyframe in the
+		// queue - it is the decoder's anchor. Losing it (a post-seek
+		// catch-up burst is exactly when the anchor sits at the head)
+		// stalls the picture until the next keyframe = a hard freeze.
+		// Containers that set no keyframe flags at all: trim nothing -
+		// an unbounded-but-decodable queue beats a frozen picture (the
+		// hard ceiling above still bounds memory).
+		VPKT *p = video.qhead, *lastkey = 0;
+		while (p) {
+			if (p->pkt->flags & AV_PKT_FLAG_KEY) lastkey = p;
+			p = p->next;
+		}
+		if (lastkey && lastkey != video.qhead) {
+			while (video.qhead != lastkey) video_drop_head();
+		} else if (!lastkey) {
+			while (video.qcount > VQ_MAX) video_drop_head();
+		}
+	}
 	if (video.qtail) video.qtail->next = n; else video.qhead = n;
 	video.qtail = n;
 	video.qcount++;
