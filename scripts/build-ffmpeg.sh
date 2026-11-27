@@ -219,7 +219,7 @@ if grep -q 'WC_ERR_INVALID_CHARS' "$FFSRC/libavutil/wchar_filename.h"; then
 	echo "patched wchar_filename.h: WC_ERR_INVALID_CHARS -> 0 (XP-safe)"
 fi
 
-if [[ ! -f $PREFIX/.ffmpeg-xmp-config-v3 ]]; then
+if [[ ! -f $PREFIX/.ffmpeg-xmp-config-v4 ]]; then
 	log "generating component lists (all decoders incl. video)"
 	eval "$(python3 scripts/gen-component-lists.py "$FFSRC" | grep '^[A-Z]*=')"
 	log "decoders: $(tr ',' '\n' <<<"$ALLDECODERS" | wc -l), demuxers: $(tr ',' '\n' <<<"$DEMUXERS" | wc -l)"
@@ -236,6 +236,7 @@ if [[ ! -f $PREFIX/.ffmpeg-xmp-config-v3 ]]; then
 		--enable-parser="$PARSERS" \
 		--enable-bsf="$BSFS" \
 		--enable-protocol=file \
+		--enable-protocol=http \
 		--enable-libfdk-aac --enable-libcodec2 --enable-libopencore-amrnb \
 		--enable-libopencore-amrwb --enable-libgme \
 		--enable-zlib --enable-bzlib --enable-lzma \
@@ -252,7 +253,8 @@ if [[ ! -f $PREFIX/.ffmpeg-xmp-config-v3 ]]; then
 	( cd "$FFSRC" && make -j$JOBS && make install )
 	# config marker - bump the suffix whenever the configure options change so
 	# stale cached FFmpeg builds get rebuilt with the new configuration.
-	touch "$PREFIX/.ffmpeg-xmp-config-v3"
+	# (v4: +http protocol for HLS segments)
+	touch "$PREFIX/.ffmpeg-xmp-config-v4"
 fi
 
 log "done - FFmpeg libs in $PREFIX/lib"
