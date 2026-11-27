@@ -10,7 +10,7 @@ on:
     branches: [main, lrc-lyrics]
 
 permissions:
-  contents: write # for the 'latest' release upload
+  contents: read
 
 concurrency:
   group: xmp-ffmpeg-video-build
@@ -90,22 +90,3 @@ jobs:
             branch-source.zip
           retention-days: 30
 
-      - name: Publish GitHub Release (add-only, never touches old releases)
-        if: success() && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/lrc-lyrics')
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          VER=${{ steps.ver.outputs.ver }}
-          RUN=${{ github.run_number }}
-          7z a "xmp-ffmpeg-video-$VER.zip" build/xmp-ffmpeg.dll README.md
-          # ADD-ONLY: never delete/modify existing releases. Tag = v<version>,
-          # or v<version>.<run> when that version already has a release.
-          TAG="v$VER"
-          TITLE="xmp-ffmpeg-video $VER"
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            TAG="v$VER.$RUN"
-            TITLE="xmp-ffmpeg-video $VER (build $RUN)"
-          fi
-          gh release create "$TAG" "xmp-ffmpeg-video-$VER.zip" --repo "$GITHUB_REPOSITORY" \
-            --title "$TITLE" \
-            --notes "Auto-built by GitHub Actions (run $RUN). Unzip and drop xmp-ffmpeg.dll into the XMPlay folder (use INSTEAD of the audio-only xmp-ffmpeg.dll, not alongside). All FFmpeg libraries are linked statically - no DLL dependencies."
