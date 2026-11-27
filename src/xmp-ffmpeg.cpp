@@ -1054,8 +1054,9 @@ static int sa_open(FFMPEG *f)
 	}
 	// waveOut (WinMM) driver: the app controls the buffer depth (2×samples
 	// through the kernel audio engine), unlike WASAPI's fixed small quantum -
-	// a real jitter tank on DPC-stalled machines
-	SDL_SetHint(SDL_HINT_AUDIODRIVER, "winmm");
+	// a real jitter tank on DPC-stalled machines. The hint string is passed
+	// directly: this SDL build's SDL_hints.h lacks the AUDIODRIVER macro.
+	SDL_SetHint("SDL_AUDIODRIVER", "winmm");
 	if (SDL_Init(SDL_INIT_AUDIO) != 0) {
 		logmsg("dv: SDL audio init failed: %s", SDL_GetError());
 		return 0;
