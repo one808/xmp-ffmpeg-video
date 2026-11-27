@@ -3696,6 +3696,11 @@ extern "C" __declspec(dllexport) XMPIN *WINAPI XMPIN_GetInterface(DWORD face, In
 	xmpfreg   = (XMPFUNC_REGISTRY*)faceproc(XMPFUNC_REGISTRY_FACE);
 	xmpver = xmpfmisc->GetVersion();
 	InitializeCriticalSection(&g_loglock); // log handle + guard (cheap logmsg)
+	// pin SDL's audio driver NOW: the video window thread inits the SDL audio
+	// subsystem early and the driver is fixed at first init, so a hint set
+	// later (in sa_open) is ignored - that is why the last build still ran
+	// wasapi. waveOut gives app-controlled buffers (the jitter tank).
+	SDL_SetHint("SDL_AUDIODRIVER", "winmm");
 	InitializeCriticalSection(&video.lock);
 	InitializeCriticalSection(&video.qlock);
 	InitializeCriticalSection(&video.clocklock);
