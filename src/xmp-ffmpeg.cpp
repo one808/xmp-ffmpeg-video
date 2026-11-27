@@ -1052,11 +1052,6 @@ static int sa_open(FFMPEG *f)
 			f->dec->ch_layout.nb_channels);
 		return 0;
 	}
-	// waveOut (WinMM) driver: the app controls the buffer depth (2×samples
-	// through the kernel audio engine), unlike WASAPI's fixed small quantum -
-	// a real jitter tank on DPC-stalled machines. The hint string is passed
-	// directly: this SDL build's SDL_hints.h lacks the AUDIODRIVER macro.
-	SDL_SetHint("SDL_AUDIODRIVER", "winmm");
 	if (SDL_Init(SDL_INIT_AUDIO) != 0) {
 		logmsg("dv: SDL audio init failed: %s", SDL_GetError());
 		return 0;
@@ -3698,9 +3693,11 @@ extern "C" __declspec(dllexport) XMPIN *WINAPI XMPIN_GetInterface(DWORD face, In
 	InitializeCriticalSection(&g_loglock); // log handle + guard (cheap logmsg)
 	// pin SDL's audio driver NOW: the video window thread inits the SDL audio
 	// subsystem early and the driver is fixed at first init, so a hint set
-	// later (in sa_open) is ignored - that is why the last build still ran
-	// wasapi. waveOut gives app-controlled buffers (the jitter tank).
-	SDL_SetHint("SDL_AUDIODRIVER", "winmm");
+	// later (in sa_open) is ignored. waveOut (WinMM) gives app-controlled
+	// buffers (the jitter tank). The hint's NAME is "SDL_AUDIO_DRIVER"
+	// (that string value is what the audio subsystem reads) - passing the
+	// macro's own name "SDL_AUDIODRIVER" silently does nothing.
+	SDL_SetHint("SDL_AUDIO_DRIVER", "winmm");
 	InitializeCriticalSection(&video.lock);
 	InitializeCriticalSection(&video.qlock);
 	InitializeCriticalSection(&video.clocklock);
