@@ -7,7 +7,9 @@ run-name: "xmp-ffmpeg · ${{ inputs.linkage || 'static' }}"
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    # tmp-local-build: temp branch - self-triggers so the local project can be
+    # built without touching main (delete this entry when the branch is deleted)
+    branches: [main, tmp-local-build]
 
 permissions:
   contents: read
