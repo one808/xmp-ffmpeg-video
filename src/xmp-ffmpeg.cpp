@@ -333,11 +333,31 @@ static char *BuildTags(FFMPEG *f)
 
 // -- queue (called from the audio decode path; takes ownership of pkt)
 
-// queue cap: without it, a consumer that cannot keep up grows memory
+// Queue cap: without it, a consumer that cannot keep up grows memory
 // without bound (positive feedback: more backlog -> more GC/thrash ->
-// slower consumer). Overflow drops the OLDEST packet so the picture
-// stays close to "now" (the decoder resynchronises at the next keyframe).
-#define VQ_MAX 256
+// slower consumer).
+//
+// Overflow policy: drop from the OLDEST side, but NEVER drop the keyframe
+// that sits at the head - it is the decoder's anchor. Throwing it away
+// (which the old one-shot drop did during transient post-seek backlog)
+// stalls the picture until the next keyframe = a hard freeze. The
+// consumer drains the backlog at real-time pace, so the anchor is only
+// protected against TRANSIENT spikes; under PERSISTENT overload the
+// keyframe gets decoded+freed anyway, after which the cap applies to the
+// ordinary packets. The hard ceiling (2x the soft cap) keeps memory
+// bounded even in pathological cases.
+#define VQ_MAX 512
+
+static void video_drop_head() // frees the oldest packet; caller holds video.lock
+{
+	VPKT *o = video.qhead;
+	if (!o) return;
+	video.qhead = o->next;
+	if (!video.qhead) video.qtail = 0;
+	video.qcount--;
+	av_packet_free(&o->pkt);
+	free(o);
+}
 
 static void video_enqueue(AVPacket *pkt)
 {
@@ -347,14 +367,10 @@ static void video_enqueue(AVPacket *pkt)
 	n->next = 0;
 	n->pkt = pkt;
 	EnterCriticalSection(&video.lock);
-	if (video.qcount >= VQ_MAX && video.qhead) {
-		VPKT *o = video.qhead;
-		video.qhead = o->next;
-		if (!video.qhead) video.qtail = 0;
-		video.qcount--;
-		av_packet_free(&o->pkt);
-		free(o);
-	}
+	while (video.qcount > VQ_MAX * 2) video_drop_head();              // hard ceiling
+	while (video.qcount > VQ_MAX
+		&& !(video.qhead && (video.qhead->pkt->flags & AV_PKT_FLAG_KEY)))
+		video_drop_head();                                             // keep the anchor
 	if (video.qtail) video.qtail->next = n; else video.qhead = n;
 	video.qtail = n;
 	video.qcount++;
