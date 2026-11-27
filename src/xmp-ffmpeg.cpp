@@ -138,6 +138,7 @@ struct VIDEO {
 	BOOL vis_blank;               // vis area currently black (cleared on stop)
 	volatile BOOL seeking;         // seek catch-up in progress (show black meanwhile)
 	double seek_floor;             // the seek target: the picture starts exactly there
+	BOOL vdec_err;                 // video decoder in error state (resync at next keyframe)
 };
 static VIDEO video;
 
@@ -458,6 +459,17 @@ static char *BuildTags(FFMPEG *f)
 
 // -- queue (called from the audio decode path; takes ownership of pkt)
 
+static void video_drop_head() // frees the oldest packet; caller holds video.lock
+{
+	VPKT *o = video.qhead;
+	if (!o) return;
+	video.qhead = o->next;
+	if (!video.qhead) video.qtail = 0;
+	video.qcount--;
+	av_packet_free(&o->pkt);
+	free(o);
+}
+
 static void video_enqueue(AVPacket *pkt)
 {
 	if (!video.active || video.vstream < 0) { av_packet_free(&pkt); return; }
@@ -466,12 +478,29 @@ static void video_enqueue(AVPacket *pkt)
 	n->next = 0;
 	n->pkt = pkt;
 	EnterCriticalSection(&video.lock);
-	if (video.qcount > 600) { // bounded queue: drop the new packet instead of
-		LeaveCriticalSection(&video.lock); // growing without limit
-		av_packet_free(&pkt);
-		free(n);
-		return;
+	// keyframe-safe overflow (ported from tmp-local-build): drop from the
+	// OLDEST side, but keep the NEWEST keyframe in the queue - it is the
+	// decoder's anchor; losing it stalls the picture until the next
+	// keyframe. The hard ceiling (2x the soft cap) keeps memory bounded
+	// even when the anchor itself is stale.
+	int dropped = 0;
+	while (video.qcount > 1200) { video_drop_head(); dropped++; }
+	if (video.qcount > 600) {
+		VPKT *p = video.qhead, *lastkey = 0;
+		while (p) {
+			if (p->pkt->flags & AV_PKT_FLAG_KEY) lastkey = p;
+			p = p->next;
+		}
+		if (lastkey && lastkey != video.qhead)
+			while (video.qhead != lastkey) { video_drop_head(); dropped++; }
+		else if (!lastkey)
+			while (video.qcount > 600) { video_drop_head(); dropped++; }
 	}
+	if (dropped)
+		logmsg("qe: overflow dropped %d (keyframe_kept=%d qcount=%d)",
+			dropped,
+			(video.qhead && (video.qhead->pkt->flags & AV_PKT_FLAG_KEY)) ? 1 : 0,
+			video.qcount);
 	if (video.qtail) video.qtail->next = n; else video.qhead = n;
 	video.qtail = n;
 	video.qcount++;
@@ -487,6 +516,7 @@ static void video_flush()
 	video.qcount = 0;
 	video.have_frame = FALSE;
 	video.v_eof_sent = video.demux_eof_seen = FALSE;
+	video.vdec_err = FALSE;
 	video.last_pts = -1; // new timeline after a seek
 	if (video.vdec) avcodec_flush_buffers(video.vdec);
 	LeaveCriticalSection(&video.lock);
@@ -594,7 +624,21 @@ static void video_tick()
 				nstarve++;
 				break; // starved - wait for more packets
 			}
-			if (ret < 0) break; // drained or error
+			if (ret < 0) {
+				if (!video.vdec_err && video.qhead) {
+					// decoder wedged (common right after a seek): resync at
+					// the newest keyframe still queued, keep feeding
+					video.vdec_err = TRUE;
+					VPKT *p = video.qhead, *lk = 0;
+					while (p) { if (p->pkt->flags & AV_PKT_FLAG_KEY) lk = p; p = p->next; }
+					if (lk && lk != video.qhead)
+						while (video.qhead != lk) video_drop_head();
+					avcodec_flush_buffers(video.vdec);
+					logmsg("vt: vdec err=%d -> resync (keyframe_in_queue=%d qcount=%d)",
+						ret, lk ? 1 : 0, video.qcount);
+				}
+				break;
+			}
 			// timestamp: real pts when present, else advance from the last one
 			double pts;
 			if (video.vframe->best_effort_timestamp != AV_NOPTS_VALUE) {
@@ -606,6 +650,7 @@ static void video_tick()
 			video.frame_pts = pts;
 			video.frame_sar = video.vframe->sample_aspect_ratio;
 			video.have_frame = TRUE;
+			video.vdec_err = FALSE;
 			continue;
 		}
 		// have a decoded frame: show it when due, drop when far too late.
