@@ -1052,6 +1052,10 @@ static int sa_open(FFMPEG *f)
 			f->dec->ch_layout.nb_channels);
 		return 0;
 	}
+	// waveOut (WinMM) driver: the app controls the buffer depth (2×samples
+	// through the kernel audio engine), unlike WASAPI's fixed small quantum -
+	// a real jitter tank on DPC-stalled machines
+	SDL_SetHint(SDL_HINT_AUDIODRIVER, "winmm");
 	if (SDL_Init(SDL_INIT_AUDIO) != 0) {
 		logmsg("dv: SDL audio init failed: %s", SDL_GetError());
 		return 0;
@@ -1097,8 +1101,9 @@ static int sa_open(FFMPEG *f)
 		SDL_CloseAudioDevice(sa_dev); sa_dev = 0;
 		return 0;
 	}
-	logmsg("dv: SDL audio open: %dHz %dch s16 target %.0fms",
-		sa_rate, sa_ch, (double)sa_target * 1000.0 / sa_bps);
+	logmsg("dv: SDL audio open: %dHz %dch s16 target %.0fms driver=%s",
+		sa_rate, sa_ch, (double)sa_target * 1000.0 / sa_bps,
+		SDL_GetCurrentAudioDriver());
 	return 1;
 }
 
