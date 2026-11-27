@@ -20,9 +20,13 @@ echo "== generating version resource (VERSIONINFO) =="
 sed -e "s/@VERSION@/$VER/g" -e "s/@VERSIONNUM@/$VERNUM/g" src/xmp-ffmpeg.rc > build/xmp-ffmpeg.rc
 $TRIPLE-windres -O coff build/xmp-ffmpeg.rc build/xmp-ffmpeg-res.o
 
-echo "== compiling xmp-ffmpeg.cpp =="
+# build id = git SHA + UTC time (the About box shows it, so a running DLL can
+# be identified exactly - "which build am I actually testing?")
+BUILDID="$(git rev-parse --short HEAD 2>/dev/null || echo nogit)-$(date -u +%Y%m%d-%H%M)"
+echo "== compiling xmp-ffmpeg.cpp (build id: $BUILDID) =="
 $TRIPLE-g++ $CFLAGS_XP $DEFS_XP -Os -fno-exceptions -fno-rtti \
 	-DXMP_FFMPEG_VERSION=\"$VER\" \
+	-DXMP_BUILD_ID=\"$BUILDID\" \
 	-Ixmp-sdk -I"$PREFIX/include" \
 	-c src/xmp-ffmpeg.cpp -o build/xmp-ffmpeg.o
 

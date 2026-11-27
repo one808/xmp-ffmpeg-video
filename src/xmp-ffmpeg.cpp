@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdarg.h>
 
 #include <windows.h>
 #include "xmpin.h"
@@ -38,6 +39,10 @@ extern "C" {
 #define XMP_FFMPEG_VERSION "1.1"
 #endif
 #define PLUGIN_VER  XMP_FFMPEG_VERSION
+// injected by scripts/build-plugin.sh: git SHA + UTC build time
+#ifndef XMP_BUILD_ID
+#define XMP_BUILD_ID "local"
+#endif
 
 static XMPFUNC_IN     *xmpfin;
 static XMPFUNC_MISC   *xmpfmisc;
@@ -62,8 +67,8 @@ struct FFMPEG {
 	DWORD bitrate;       // kbps (0 = unknown)
 	BOOL seekable, netfile, sent_eof, eof;
 	volatile BOOL demux_eof; // av_read_frame hit EOF (read by render thread)
-	double seek_to;      // last seek target (seconds), 0 = none; audio is muted until the content reaches it
-	double sil_t;        // file time of the first staged sample while silencing; -1 = not pinned yet
+	double seek_to;      // last seek target (seconds), 0 = none; audio content before it is skipped
+	BOOL seek_log, seek_log_a; // seek diagnostics: video landing / audio skip each logged once
 	float *outbuf;       // interleaved float32 staging buffer
 	DWORD outcap;        // capacity in floats
 	DWORD outlen, outp;  // floats valid / consumed
@@ -100,6 +105,8 @@ struct VIDEO {
 	BOOL have_frame;           // decoded frame in vframe, waiting for its time
 	double frame_pts;
 	double seek_to;            // last seek target: the picture starts exactly there (0 = none)
+	BOOL vdec_err;            // decoder in error state (resync at the next keyframe)
+	BOOL seek_presented;      // first post-seek frame already presented (log once)
 	BYTE *dib;                 // BGRA DIBits
 	BITMAPINFO bmi;
 	int dibw, dibh;
@@ -115,6 +122,7 @@ static void video_enqueue(AVPacket *pkt); // takes ownership
 static void video_flush(double seek_to);
 static void video_attach(FFMPEG *f);
 static void video_detach();
+static void vlog(const char *fmt, ...); // seek diagnostics -> %TEMP%\xmp-ffmpeg-video.log
 
 // ---------------------------------------------------------------- XMPFILE I/O
 
@@ -203,7 +211,6 @@ static FFMPEG *InitFF(const char *filename, XMPFILE file)
 	if (!f) return 0;
 	f->file = file;
 	f->vstream = -1;
-	f->sil_t = -1; // silence pin (seek handling) starts unknown
 	DWORD type = xmpffile->GetType(file);
 	f->seekable = (type != XMPFILE_TYPE_NETSTREAM);
 	f->netfile = (type >= XMPFILE_TYPE_NETFILE);
@@ -363,8 +370,9 @@ static void video_enqueue(AVPacket *pkt)
 	n->next = 0;
 	n->pkt = pkt;
 	EnterCriticalSection(&video.lock);
+	int dropped = 0;
 	// hard ceiling: memory must stay bounded no matter what
-	while (video.qcount > VQ_MAX * 2) video_drop_head();
+	while (video.qcount > VQ_MAX * 2) { video_drop_head(); dropped++; }
 	if (video.qcount > VQ_MAX) {
 		// soft cap: drop stale packets, but keep the NEWEST keyframe in the
 		// queue - it is the decoder's anchor. Losing it (a post-seek
@@ -379,11 +387,15 @@ static void video_enqueue(AVPacket *pkt)
 			p = p->next;
 		}
 		if (lastkey && lastkey != video.qhead) {
-			while (video.qhead != lastkey) video_drop_head();
+			while (video.qhead != lastkey) { video_drop_head(); dropped++; }
 		} else if (!lastkey) {
-			while (video.qcount > VQ_MAX) video_drop_head();
+			while (video.qcount > VQ_MAX) { video_drop_head(); dropped++; }
 		}
 	}
+	if (dropped)
+		vlog("q overflow: dropped %d packets (qcount now %d, keyframe_kept=%d)\n",
+			dropped, video.qcount,
+			(video.qhead && (video.qhead->pkt->flags & AV_PKT_FLAG_KEY)) ? 1 : 0);
 	if (video.qtail) video.qtail->next = n; else video.qhead = n;
 	video.qtail = n;
 	video.qcount++;
@@ -399,6 +411,7 @@ static void video_flush(double seek_to)
 	video.qcount = 0;
 	video.have_frame = FALSE;
 	video.v_eof_sent = video.demux_eof_seen = FALSE;
+	video.vdec_err = video.seek_presented = FALSE;
 	video.seek_to = seek_to;
 	if (video.vdec) avcodec_flush_buffers(video.vdec);
 	LeaveCriticalSection(&video.lock);
@@ -505,12 +518,27 @@ static void video_tick()
 					}
 					break; // starved - wait for more packets
 				}
-				if (ret < 0) break; // drained or error
+				if (ret < 0) {
+					if (!video.vdec_err && video.qhead) {
+						// decoder wedged (common right after a seek): resync
+						// at the newest keyframe still queued, keep feeding
+						video.vdec_err = TRUE;
+						VPKT *p = video.qhead, *lk = 0;
+						while (p) { if (p->pkt->flags & AV_PKT_FLAG_KEY) lk = p; p = p->next; }
+						if (lk && lk != video.qhead)
+							while (video.qhead != lk) video_drop_head();
+						avcodec_flush_buffers(vdec);
+						vlog("tick: vdec err=%d -> resync (keyframe_in_queue=%d, qcount=%d)\n",
+							ret, lk ? 1 : 0, video.qcount);
+					}
+					break;
+				}
 				double pts = t; // fall back to the clock when no stamp
 				if (vframe->best_effort_timestamp != AV_NOPTS_VALUE)
 					pts = vframe->best_effort_timestamp * av_q2d(video.tb);
 				video.frame_pts = pts;
 				video.have_frame = TRUE;
+				video.vdec_err = FALSE;
 				continue;
 			}
 			// have a decoded frame: show it when due, drop when far too late
@@ -527,6 +555,11 @@ static void video_tick()
 			video_render_dib();
 			video.have_frame = FALSE;
 			do_blit = 1;
+			if (video.seek_to > 0 && !video.seek_presented) {
+				video.seek_presented = TRUE;
+				vlog("first present after seek: frame_pts=%.2f t=%.2f\n",
+					video.frame_pts, t);
+			}
 			break; // one present per tick is enough
 		}
 	}
@@ -686,17 +719,45 @@ static void video_detach()
 	if (video.hwnd) { video.hidden = TRUE; ShowWindow(video.hwnd, SW_HIDE); }
 }
 
+// ------------------------------------------------- seek diagnostics log
+// Appends to %TEMP%\xmp-ffmpeg-video.log: seek landing, audio skip/live,
+// queue overflow, decoder resync, first post-seek present. Event-based -
+// no per-frame spam. Delete the file for a clean capture.
+static CRITICAL_SECTION vlog_lock;
+static FILE *vlog_fp;
+
+static void vlog(const char *fmt, ...)
+{
+	EnterCriticalSection(&vlog_lock);
+	if (!vlog_fp) {
+		char dir[MAX_PATH], path[MAX_PATH + 32];
+		DWORD n = GetEnvironmentVariableA("TEMP", dir, MAX_PATH);
+		if (n && n < MAX_PATH) {
+			sprintf(path, "%s\\xmp-ffmpeg-video.log", dir);
+			vlog_fp = fopen(path, "a");
+		}
+	}
+	if (vlog_fp) {
+		va_list ap;
+		va_start(ap, fmt);
+		vfprintf(vlog_fp, fmt, ap);
+		va_end(ap);
+		fflush(vlog_fp);
+	}
+	LeaveCriticalSection(&vlog_lock);
+}
+
 // ============================================================= XMPIN methods
 
 static void WINAPI FF_About(HWND win)
 {
-	char msg[256];
+	char msg[320];
 	sprintf(msg, "%s %s\n\nPlays any audio format FFmpeg can decode,\n"
 		"including the audio stream of video files,\n"
 		"with an automatic borderless video window.\n\n"
 		"Video window: drag to move, drag edges to resize,\n"
 		"double-click or F/Enter = fullscreen, ESC = leave/hide.\n\n"
-		"FFmpeg: %s\nXMPlay plugin interface %u",
+		"FFmpeg: %s\nBuild: " XMP_BUILD_ID "\nXMPlay plugin interface %u",
 		PLUGIN_NAME, PLUGIN_VER, av_version_info(), (unsigned)XMPIN_FACE);
 	MessageBox(win, msg, "About " PLUGIN_NAME, MB_ICONINFORMATION);
 }
@@ -777,6 +838,7 @@ static void WINAPI FF_GetGeneralInfo(char *buf)
 	FFMPEG *f = current;
 	const AVInputFormat *iformat = f->fmt->iformat;
 	buf += sprintf(buf, "Format\t%s\r", iformat && iformat->long_name ? iformat->long_name : "?");
+	buf += sprintf(buf, "Build\t%s\r", XMP_BUILD_ID);
 	buf += sprintf(buf, "Audio codec\t%s\r", f->codec ? f->codec : "?");
 	if (f->vstream >= 0)
 		buf += sprintf(buf, "Video\t%s %dx%d\r", f->video_codec ? f->video_codec : "?", f->vw, f->vh);
@@ -826,27 +888,6 @@ static DWORD WINAPI FF_Process(float *buffer, DWORD count)
 			if (got < 0) got = 0;
 			f->outlen = (DWORD)got * ch;
 			f->outp = 0;
-			// after a seek the demuxer lands on the keyframe BEFORE the target:
-			// mute the audio content that precedes it, so the stream aligns
-			// with XMPlay's clock (set to the target) instead of replaying up
-			// to a whole GOP of "early" audio on every seek.
-			if (got > 0 && f->seek_to > 0) {
-				if (f->sil_t < 0) { // pin the timeline on the first frame
-					int64_t p = f->frame->best_effort_timestamp;
-					if (p == AV_NOPTS_VALUE) p = f->frame->pts;
-					if (p == AV_NOPTS_VALUE) f->seek_to = 0; // can't pin - give up
-					else f->sil_t = p * av_q2d(f->fmt->streams[f->stream]->time_base);
-				}
-				if (f->seek_to > 0) {
-					double lead = f->seek_to - f->sil_t;
-					DWORD zero = lead > 0 ? (DWORD)(lead * f->dec->sample_rate) : 0;
-					DWORD total = (DWORD)got;
-					if (zero > total) zero = total;
-					if (zero) memset(f->outbuf, 0, (size_t)zero * ch * sizeof(float));
-					f->sil_t += (double)total / f->dec->sample_rate;
-					if (f->sil_t >= f->seek_to) f->seek_to = 0; // real content reached the clock
-				}
-			}
 			continue;
 		}
 		if (ret == AVERROR_EOF || (ret < 0 && ret != AVERROR(EAGAIN))) {
@@ -858,15 +899,43 @@ static DWORD WINAPI FF_Process(float *buffer, DWORD count)
 		ret = av_read_frame(f->fmt, f->pkt);
 		if (ret >= 0) {
 			if (f->pkt->stream_index == f->vstream && video.active) {
+				double ppts = (f->pkt->pts != AV_NOPTS_VALUE)
+					? f->pkt->pts * av_q2d(f->fmt->streams[f->vstream]->time_base) : 0;
 				// hand the video packet to the render thread
 				AVPacket *vp = av_packet_alloc();
 				if (vp) { av_packet_move_ref(vp, f->pkt); video_enqueue(vp); }
 				else av_packet_unref(f->pkt);
+				if (f->seek_log) { // where did the demuxer actually land?
+					f->seek_log = FALSE;
+					vlog("video land: target=%.2f first_pkt=%.2f gap=%.2f\n",
+						f->seek_to, ppts, f->seek_to - ppts);
+				}
 				continue;
 			}
 			if (f->pkt->stream_index != f->stream) {
 				av_packet_unref(f->pkt); // other streams - skip
 				continue;
+			}
+			if (f->seek_to > 0) {
+				// audio decodes without references: skip the packets whose
+				// content precedes the target, so the stream starts EXACTLY
+				// at the target - no silent gap, no permanent A/V offset.
+				int64_t p = f->pkt->pts;
+				if (p == AV_NOPTS_VALUE) p = f->pkt->dts;
+				if (p != AV_NOPTS_VALUE) {
+					double target = f->seek_to;
+					double apt = p * av_q2d(f->fmt->streams[f->stream]->time_base);
+					if (apt < target - 0.02) {
+						if (f->seek_log_a) {
+							f->seek_log_a = FALSE;
+							vlog("audio skip: first_pkt=%.2f target=%.2f\n", apt, target);
+						}
+						av_packet_unref(f->pkt);
+						continue;
+					}
+					f->seek_to = 0; // content reached the target: real audio from here
+					vlog("audio live: target=%.2f first_pkt=%.2f\n", target, apt);
+				}
 			}
 			avcodec_send_packet(f->dec, f->pkt);
 			av_packet_unref(f->pkt);
@@ -895,7 +964,7 @@ static double WINAPI FF_SetPosition(DWORD pos)
 	if (!f->seekable) return -1;
 	if (av_seek_frame(f->fmt, -1, (int64_t)(t * AV_TIME_BASE), AVSEEK_FLAG_BACKWARD) < 0) {
 		f->seek_to = 0;
-		f->sil_t = -1;
+		f->seek_log = f->seek_log_a = FALSE;
 		return -1;
 	}
 	avcodec_flush_buffers(f->dec);
@@ -903,9 +972,9 @@ static double WINAPI FF_SetPosition(DWORD pos)
 	f->outlen = f->outp = 0;
 	f->eof = f->sent_eof = FALSE;
 	f->demux_eof = FALSE;
-	f->seek_to = t;    // mute audio until the content actually reaches the target
-	f->sil_t = -1;
-	video_flush(t);    // reposition the video too: picture starts exactly at t
+	f->seek_to = t;             // skip audio content that precedes the target
+	f->seek_log = f->seek_log_a = TRUE;
+	video_flush(t);             // reposition the video too: picture starts at t
 	f->pos = t;
 	return t;
 }
@@ -966,6 +1035,7 @@ extern "C" __declspec(dllexport) XMPIN *WINAPI XMPIN_GetInterface(DWORD face, In
 	xmpfstatus = (XMPFUNC_STATUS*)faceproc(XMPFUNC_STATUS_FACE);
 	xmpver = xmpfmisc->GetVersion();
 	InitializeCriticalSection(&video.lock);
+	InitializeCriticalSection(&vlog_lock);
 	video.vframe = av_frame_alloc(); // single shared frame for the render thread
 	video.ready = 0;
 	return &xmpin;
