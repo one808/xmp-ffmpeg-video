@@ -13,7 +13,6 @@ on:
 
 permissions:
   contents: read
-  artifacts: write
 
 concurrency:
   group: xmp-ffmpeg-video-build
