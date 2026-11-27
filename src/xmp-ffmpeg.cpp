@@ -137,6 +137,7 @@ struct VIDEO {
 	BOOL have_new;                // a decoded frame is waiting for FF_VisRenderDC
 	BOOL vis_blank;               // vis area currently black (cleared on stop)
 	volatile BOOL seeking;         // seek catch-up in progress (show black meanwhile)
+	double seek_floor;             // the seek target: the picture starts exactly there
 };
 static VIDEO video;
 
@@ -613,15 +614,17 @@ static void video_tick()
 		// `seeking` early) - keep the area black until a frame in the target
 		// window is shown.
 		if (video.frame_pts > t + 0.06) break;   // in the future - wait
-		if (video.frame_pts < t - 0.30 && (budget > 2 || video.seeking)) { // behind - drop
+		double drop_floor = t - 0.30;
+		if (video.seeking && video.seek_floor > drop_floor)
+			drop_floor = video.seek_floor;       // after a seek: no pre-target picture
+		if (video.frame_pts < drop_floor && (budget > 2 || video.seeking)) { // behind - drop
 			video.have_frame = FALSE;
 			ndrop++;
 			continue;
 		}
 		video_render_frame(); // scale into video.dib (under lock); sets have_new
 		shown_pts = video.frame_pts;
-		if (video.seeking) video.seeking = FALSE; // a shown frame is within the
-		                                         // clock window - catch-up done
+		if (video.seeking) { video.seeking = FALSE; video.seek_floor = 0; } // catch-up done
 		video.have_frame = FALSE;
 		break; // one present per tick is enough
 	}
@@ -2042,6 +2045,25 @@ static void video_late_scan(FFMPEG *f)
 	}
 }
 
+// seek skip window (set by FF_SetPosition): returns 1 when this AUDIO packet
+// must be skipped (its content precedes the seek target). Audio decodes
+// without references, so pre-target packets are simply dropped and the
+// stream starts exactly at the target - no silent gap, no permanent offset.
+// Clears ff_target once the content reaches the target, or immediately when
+// packets carry no timestamps (nothing can be skipped then).
+static int audio_skip_pre_target(FFMPEG *f, AVPacket *pkt)
+{
+	if (f->ff_target <= 0) return 0;
+	AVStream *st = f->fmt->streams[f->stream];
+	int64_t p = pkt->pts;
+	if (p == AV_NOPTS_VALUE) p = pkt->dts;
+	if (p == AV_NOPTS_VALUE) { f->ff_target = 0; return 0; }
+	double cur = (double)p * av_q2d(st->time_base);
+	if (cur < f->ff_target - 0.02) return 1;
+	f->ff_target = 0; // content reached the target: real audio from here on
+	return 0;
+}
+
 static DWORD WINAPI FF_Process(float *buffer, DWORD count)
 {
 	FFMPEG *f = current;
@@ -2069,48 +2091,12 @@ static DWORD WINAPI FF_Process(float *buffer, DWORD count)
 	int ch = f->dec->ch_layout.nb_channels;
 	if (ch < 1) ch = 1;
 
-	// deferred seek fast-forward (set by FF_SetPosition): skip packets up to
-	// the seek target so audio + video start AT the target, not at the (often
-	// far behind) keyframe. Audio packets are skipped (the decoder was
-	// flushed), video packets enqueued for the render thread's quick
-	// drop-catch-up. Bounded per call; on EAGAIN (m3u8 still downloading) the
-	// fast-forward simply resumes on the next call.
-	if (f->ff_target > 0 && !f->sent_eof && !f->eof) {
-		double t = f->ff_target;
-		if (video.active && f->vstream >= 0) {
-			int guard = 0;
-			while (guard++ < 400) {
-				int rr = av_read_frame(f->fmt, f->pkt);
-				if (rr < 0) {
-					if (rr == AVERROR(EAGAIN)) break; // still downloading: retry next call
-					f->ff_target = 0; // real EOF: give up the fast-forward
-					break;
-				}
-				int si = f->pkt->stream_index;
-				double cur = -1;
-				BOOL saw_pts = FALSE;
-				if (f->pkt->pts != AV_NOPTS_VALUE) {
-					cur = (double)f->pkt->pts * av_q2d(f->fmt->streams[si]->time_base);
-					saw_pts = TRUE;
-				}
-				if (guard == 1 && !saw_pts) { // no timestamps at all: can't fast-forward
-					av_packet_unref(f->pkt);
-					f->ff_target = 0;
-					break;
-				}
-				if (si == f->vstream) {
-					AVPacket *vp = av_packet_alloc();
-					if (vp) { av_packet_move_ref(vp, f->pkt); video_enqueue(vp); }
-					else av_packet_unref(f->pkt);
-				} else {
-					av_packet_unref(f->pkt); // audio before the target: skip
-				}
-				if (cur >= t) { f->ff_target = 0; break; } // reached the target
-			}
-		} else {
-			f->ff_target = 0; // audio-only track: the demuxer seeks exactly, nothing to skip
-		}
-	}
+	// Seek fast-forward (f->ff_target, set by FF_SetPosition) is handled INLINE
+	// in the two demux loops below via audio_skip_pre_target: the old
+	// 400-read pre-phase ran ahead of audio production and starved it for
+	// the whole catch-up window (the post-seek audio stutter). Inline skip
+	// is O(1) per packet, so the audio thread never blocks on catch-up -
+	// audio + video both start exactly at the target.
 
 	while (done < count) {
 		if (f->outp < f->outlen) { // staged samples available
@@ -2169,6 +2155,10 @@ static DWORD WINAPI FF_Process(float *buffer, DWORD count)
 				av_packet_unref(f->pkt); // other streams - skip
 				continue;
 			}
+			if (audio_skip_pre_target(f, f->pkt)) { // seek window: drop pre-target audio
+				av_packet_unref(f->pkt);
+				continue;
+			}
 			{ int sr = avcodec_send_packet(f->dec, f->pkt);
 			  if (sr == AVERROR(EAGAIN)) {
 				  // decoder input full: hold the packet - the OLD unconditional
@@ -2186,6 +2176,7 @@ static DWORD WINAPI FF_Process(float *buffer, DWORD count)
 		}
 		if (ret == AVERROR(EAGAIN)) continue;
 		f->sent_eof = TRUE;
+		f->ff_target = 0; // content ends before the target - stop skipping
 		f->demux_eof = TRUE;
 		EnterCriticalSection(&video.lock);
 		video.demux_eof_seen = TRUE;
@@ -2208,6 +2199,7 @@ static DWORD WINAPI FF_Process(float *buffer, DWORD count)
 			if (r2 < 0) {
 				if (r2 == AVERROR(EAGAIN)) { guard++; continue; }
 				f->sent_eof = TRUE;
+				f->ff_target = 0; // content ends before the target - stop skipping
 				f->demux_eof = TRUE;
 				EnterCriticalSection(&video.lock);
 				video.demux_eof_seen = TRUE;
@@ -2222,6 +2214,7 @@ static DWORD WINAPI FF_Process(float *buffer, DWORD count)
 				continue;
 			}
 			if (f->pkt->stream_index != f->stream) { av_packet_unref(f->pkt); continue; }
+			if (audio_skip_pre_target(f, f->pkt)) { av_packet_unref(f->pkt); continue; } // seek window: no pre-target audio
 			int sr = avcodec_send_packet(f->dec, f->pkt);
 			if (sr == 0) { av_packet_unref(f->pkt); continue; }
 			if (sr == AVERROR(EAGAIN)) {
@@ -2291,6 +2284,7 @@ static double WINAPI FF_SetPosition(DWORD pos)
 		{
 			EnterCriticalSection(&video.lock);
 			video.seeking = TRUE; // show black until the catch-up reaches the target
+			video.seek_floor = t;  // picture starts exactly at the target, not 0.3s early
 			LeaveCriticalSection(&video.lock);
 		}
 	}
