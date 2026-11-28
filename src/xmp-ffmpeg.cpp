@@ -93,12 +93,6 @@ struct FFMPEG {
 static FFMPEG *current;
 static CRITICAL_SECTION demux_lock; // guards av_read_frame/av_seek_frame/send
 
-// video queue buffering: FF_Process tops the queue up to this depth so the
-// decode thread never starves (the audio-demand feed alone delivers video
-// packets ~just-in-time; see the post-seek judder, v1.2.43 logs)
-#define VQ_TARGET 60
-#define VQ_LOOKAHEAD_MAX 64
-
 // --------------------------------------------------------------- video state
 
 struct VPKT { VPKT *next; AVPacket *pkt; };
@@ -1820,15 +1814,36 @@ static BOOL WINAPI FF_VisRenderDC(HDC dc, SIZE size, DWORD flags)
 		return TRUE;
 	}
 
+	// Snapshot the frame under the lock, blit OUTSIDE it: GDI is slow enough
+	// that holding video.lock across StretchDIBits stalls the audio thread
+	// (it enqueues every video packet under this lock) and underruns the
+	// audio buffer - the "声音卡" of this build. The DIB is only reallocated
+	// under the lock at stream attach (resolution change), and sar data is
+	// attach-time too, so the snapshot stays valid across the blit.
+	BYTE *dib;
+	BITMAPINFO bmi;
+	int dw, dh;
+	AVRational fsar;
+	BOOL fresh = FALSE;
 	EnterCriticalSection(&video.lock);
-	if (!video.have_new) { LeaveCriticalSection(&video.lock); return FALSE; } // unchanged
+	if (video.have_new) {
+		video.have_new = FALSE;
+		dib = video.dib;
+		bmi = video.bmi;
+		dw = video.dibw;
+		dh = video.dibh;
+		fsar = video.frame_sar;
+		fresh = TRUE;
+	}
+	LeaveCriticalSection(&video.lock);
+	if (!fresh) return FALSE; // unchanged
 	FillRect(dc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
-	if (video.dibw >= 1 && video.dibh >= 1) {
+	if (dw >= 1 && dh >= 1) {
 		double sar = 1.0;
-		AVRational fsar = video.frame_sar;
-		if (fsar.num <= 0 || fsar.den <= 0) fsar = video.sar;
-		if (fsar.num > 0 && fsar.den > 0) sar = (double)fsar.num / fsar.den;
-		double va = (double)video.dibw / video.dibh * sar;
+		AVRational s = fsar;
+		if (s.num <= 0 || s.den <= 0) s = video.sar;
+		if (s.num > 0 && s.den > 0) sar = (double)s.num / s.den;
+		double va = (double)dw / dh * sar;
 		double wa = (double)size.cx / (size.cy > 0 ? size.cy : 1);
 		int w, h, x, y;
 		if (wa > va) { h = size.cy; w = (int)(h * va + 0.5); x = (size.cx - w) / 2; y = 0; }
@@ -1838,12 +1853,10 @@ static BOOL WINAPI FF_VisRenderDC(HDC dc, SIZE size, DWORD flags)
 		// smooth (filtered) scaling - the default GDI stretch jaggies badly,
 		// especially when shrinking the video into a small vis area
 		int oldmode = SetStretchBltMode(dc, HALFTONE);
-		StretchDIBits(dc, x, y, w, h, 0, 0, video.dibw, video.dibh,
-			video.dib, &video.bmi, DIB_RGB_COLORS, SRCCOPY);
+		StretchDIBits(dc, x, y, w, h, 0, 0, dw, dh,
+			dib, &bmi, DIB_RGB_COLORS, SRCCOPY);
 		SetStretchBltMode(dc, oldmode);
 	}
-	video.have_new = FALSE;
-	LeaveCriticalSection(&video.lock);
 	return TRUE;
 }
 
@@ -2229,50 +2242,11 @@ static DWORD WINAPI FF_Process(float *buffer, DWORD count)
 		avcodec_send_packet(f->dec, NULL); // end of input: drain the decoder
 	}
 
-	// top the video queue up to VQ_TARGET. The demand loop above only reads
-	// what the audio request needs, so video packets arrive just-in-time
-	// (the queue hovers at 0-2 and the decode thread starves, worse after a
-	// seek when catch-up needs extra frames - the judder in the v1.2.43
-	// logs: q=0 starved=40/s dropped=15/s). A ~1.6s buffer absorbs seek
-	// catch-up and m3u8 segment stalls. Audio packets read on the way are
-	// forwarded to the decoder, held in f->pend_a when its input is full.
-	if (video.active && f->vstream >= 0 && !f->sent_eof && !f->eof) {
-		int guard = 0;
-		while (video.qcount < VQ_TARGET && guard++ < VQ_LOOKAHEAD_MAX
-			&& !f->sent_eof && f->pend_n < 8) {
-			int r2 = av_read_frame(f->fmt, f->pkt);
-			if (r2 < 0) {
-				if (r2 == AVERROR(EAGAIN)) { guard++; continue; }
-				f->sent_eof = TRUE;
-				f->ff_target = 0; // content ends before the target - stop skipping
-				f->demux_eof = TRUE;
-				EnterCriticalSection(&video.lock);
-				video.demux_eof_seen = TRUE;
-				LeaveCriticalSection(&video.lock);
-				avcodec_send_packet(f->dec, NULL); // end of input: drain the decoder
-				break;
-			}
-			if (f->pkt->stream_index == f->vstream) {
-				AVPacket *vp = av_packet_alloc();
-				if (vp) { av_packet_move_ref(vp, f->pkt); video_enqueue(vp); }
-				else av_packet_unref(f->pkt);
-				continue;
-			}
-			if (f->pkt->stream_index != f->stream) { av_packet_unref(f->pkt); continue; }
-			if (audio_skip_pre_target(f, f->pkt)) { av_packet_unref(f->pkt); continue; } // seek window: no pre-target audio
-			int sr = avcodec_send_packet(f->dec, f->pkt);
-			if (sr == 0) { av_packet_unref(f->pkt); continue; }
-			if (sr == AVERROR(EAGAIN)) {
-				AVPacket *keep = av_packet_alloc();
-				if (keep) { av_packet_move_ref(keep, f->pkt); f->pend_a[f->pend_n++] = keep; }
-				else av_packet_unref(f->pkt);
-				// held in pend (drained by the main loop) - keep topping up
-				// the video queue; the loop condition caps pend at 8
-				continue;
-			}
-			av_packet_unref(f->pkt); // send error: drop it
-		}
-	}
+	// (The VQ_TARGET top-up loop was removed - it ran on the AUDIO thread and
+	// its extra demux work tied audio production to video queue depth. Video
+	// packets now flow just-in-time through the demand loop only, the
+	// tmp-local-build model; the keyframe-safe queue cap in video_enqueue
+	// remains as the memory backstop.)
 	LeaveCriticalSection(&demux_lock);
 	return done;
 }
