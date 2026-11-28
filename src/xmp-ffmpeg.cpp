@@ -1684,13 +1684,17 @@ static int lyric_render(HDC dc, int W, int H)
 	HGDIOBJ oldbr = SelectObject(dc, GetStockObject(NULL_BRUSH));
 	SetBkMode(dc, TRANSPARENT);
 	for (int k = 0; k < n; k++) {
-		int iscur = (idxs[k] == cur);
 		double dist = (double)idxs[k] - fp;
 		int y = cy + (int)(dist * lh + 0.5); // smooth sub-line position
+		// a line is colored only while the MID LINE crosses its band:
+		// enter as the band's top edge reaches the mid line, back to dim as
+		// the bottom edge leaves - the next line takes over at exactly that
+		// instant (both at |dist| = 0.5)
+		int onmid = (dist <= 0.5 && dist >= -0.5);
 		wchar_t wtext[512];
 		MultiByteToWideChar(CP_UTF8, 0, texts[k], -1, wtext, 512);
 		RECT rc = { 0, y - lh / 2, W, y + lh / 2 };
-		SetTextColor(dc, iscur ? (COLORREF)lrc_cfg.cur_color : RGB(dr, dg, db));
+		SetTextColor(dc, onmid ? (COLORREF)lrc_cfg.cur_color : RGB(dr, dg, db));
 		DrawTextW(dc, wtext, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 	}
 	SelectObject(dc, oldf);
