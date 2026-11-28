@@ -126,6 +126,7 @@ struct VIDEO {
 	double clock_base;
 	DWORD clock_tick;
 	double last_pts, frame_dur;   // pts fallback for streams without stamps
+	double pts_shift;             // raw->playlist timeline rebase (spliced uploads)
 	AVRational sar;               // non-square pixel ratio (display aspect)
 	AVRational frame_sar;         // per-frame override when present
 	BOOL have_new;                // a decoded frame is waiting for FF_VisRenderDC
@@ -640,6 +641,28 @@ static void video_tick()
 			} else {
 				pts = video.last_pts + video.frame_dur;
 			}
+			// "MV-share" playlists splice a DIFFERENT upload into the list
+			// (the "ad"): its timestamps restart near zero, and the display
+			// gate (drop frames >0.3s behind the clock) then treats the whole
+			// second half as stale - the "slideshow" crawl. Rebase the raw
+			// timeline onto the continuous playlist position:
+			if (video.last_pts < 0) {
+				// first frame after a flush (seek/open): anchor to where the
+				// demuxer is supposed to be. Raw pts far behind the target =
+				// the spliced upload's own timeline
+				double ref = video.seeking ? video.seek_floor : 0.0;
+				if (pts < ref - 5.0) {
+					video.pts_shift = ref - pts;
+					logmsg("vt: seek rebase raw=%.2f ref=%.2f (shift=%.2f)",
+						pts, ref, video.pts_shift);
+				} else video.pts_shift = 0;
+			} else if (pts < video.last_pts - 1.0) {
+				// mid-playback timeline restart at the splice point: rebase
+				video.pts_shift += video.last_pts - pts;
+				logmsg("vt: pts restart raw=%.2f last=%.2f (shift=%.2f)",
+					pts, video.last_pts, video.pts_shift);
+			}
+			pts += video.pts_shift;
 			if (pts > video.last_pts) video.last_pts = pts;
 			video.frame_pts = pts;
 			video.frame_sar = video.vframe->sample_aspect_ratio;
