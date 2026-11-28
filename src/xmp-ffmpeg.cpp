@@ -1598,13 +1598,21 @@ static int lyric_render(HDC dc, int W, int H)
 	// returns 1 if lyrics were drawn, 0 otherwise (caller falls back to black)
 	// effective time = playback clock - user offset (+offset = lyrics lag)
 	double t = video_clock_now() - (double)lrc_cfg.offset_tenths * 0.1;
-	int lh = lrc_cfg.font_size + 6; // line height in px
-	int rows = H / lh;
-	if (rows < 3) rows = 3;
-	if (rows > 12) rows = 12;
-	int mid = rows / 2; // snapshot slot the current line lands in
-	const char *texts[32];
-	int n = 0, cur = -1, i0 = 0;
+	int lh = lrc_cfg.font_size + 6;      // px the scroll travels per line
+	int cy = H / 2;                      // focal line anchored mid-panel
+
+	// fp = focal position in line-space (fractional -> smooth sub-line scroll):
+	// line i is drawn at y = cy + (i - fp) * lh. During the interval of line
+	// cur the focal normally glides from cur to cur+1. Intro settle: the
+	// FIRST line starts one line-height below the mid line and the scroll
+	// catches up over the first two intervals (1.5x), so opening a song
+	// shows the block low in the panel gliding up instead of popping at
+	// center. Seeking back to the start replays the settle.
+	double fp = 0;
+	int cur = -1;
+	const char *texts[48];
+	int idxs[48];
+	int n = 0;
 	{
 		EnterCriticalSection(&lyric.lock);
 		if (lyric.state == 2 && lyric.nlines > 0) {
@@ -1614,11 +1622,29 @@ static int lyric_render(HDC dc, int W, int H)
 			for (int i = 0; i < lyric.nlines; i++)
 				if (t >= lyric.lines[i].t) cur = i;
 			if (cur < 0) cur = 0;
-			i0 = cur - mid; // place the current line mid-panel; older lines
-			if (i0 < 0) i0 = 0; // scroll up out of the top, newer from below
-			for (int i = i0; i < lyric.nlines && n < 32; i++) {
+			// progress 0->1 through the current line's interval
+			double f = 0;
+			if (cur + 1 < lyric.nlines) {
+				double t0 = lyric.lines[cur].t, t1 = lyric.lines[cur + 1].t;
+				double span = t1 - t0;
+				f = (span > 0.0) ? (t - t0) / span : 1.0;
+				if (f < 0) f = 0;
+				if (f > 1) f = 1;
+			}
+			// last line rests centered (f stays 0)
+			if (lyric.nlines >= 3) {
+				if (cur == 0)      fp = -1.0 + 1.5 * f;
+				else if (cur == 1) fp = 0.5 + 1.5 * f;
+				else               fp = (double)cur + f;
+			} else fp = (double)cur + f;
+			int spanLines = (H / lh) + 2;
+			int a = (int)fp - spanLines;
+			int b = (int)fp + spanLines;
+			for (int i = 0; i < lyric.nlines; i++) {
+				if (i < a || i > b) continue;
 				texts[n] = lyric.lines[i].text;
-				n++;
+				idxs[n] = i;
+				if (++n >= 48) break;
 			}
 		}
 		LeaveCriticalSection(&lyric.lock);
@@ -1648,7 +1674,6 @@ static int lyric_render(HDC dc, int W, int H)
 		}
 	}
 
-	int currow = cur - i0; // snapshot slot of the current line (0..mid)
 	int bg = (int)vis_colors[0];
 	int txt = (int)vis_colors[1];
 	int R = (bg >> 16) & 0xff, G = (bg >> 8) & 0xff, B = bg & 0xff;
@@ -1657,14 +1682,15 @@ static int lyric_render(HDC dc, int W, int H)
 	HFONT oldf = (HFONT)SelectObject(dc, lrc_font);
 	HPEN oldpen = (HPEN)SelectObject(dc, GetStockObject(NULL_PEN));
 	HGDIOBJ oldbr = SelectObject(dc, GetStockObject(NULL_BRUSH));
-	for (int r = 0; r < rows; r++) {
-		if (r >= n) continue; // texts[r] = lines[i0 + r]
+	SetBkMode(dc, TRANSPARENT);
+	for (int k = 0; k < n; k++) {
+		int iscur = (idxs[k] == cur);
+		double dist = (double)idxs[k] - fp;
+		int y = cy + (int)(dist * lh + 0.5); // smooth sub-line position
 		wchar_t wtext[512];
-		MultiByteToWideChar(CP_UTF8, 0, texts[r], -1, wtext, 512);
-		RECT rc = { 0, r * lh, W, r * lh + lh };
-		COLORREF cr = (r == currow) ? (COLORREF)lrc_cfg.cur_color : RGB(dr, dg, db);
-		SetTextColor(dc, cr);
-		SetBkMode(dc, TRANSPARENT);
+		MultiByteToWideChar(CP_UTF8, 0, texts[k], -1, wtext, 512);
+		RECT rc = { 0, y - lh / 2, W, y + lh / 2 };
+		SetTextColor(dc, iscur ? (COLORREF)lrc_cfg.cur_color : RGB(dr, dg, db));
 		DrawTextW(dc, wtext, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 	}
 	SelectObject(dc, oldf);
