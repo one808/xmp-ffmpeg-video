@@ -20,18 +20,18 @@ BEGIN
     EDITTEXT        201, 66, 7, 166, 12, ES_AUTOHSCROLL
     CONTROL         "Download lyrics online when missing", 202, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 8, 24, 150, 10
     CONTROL         "Save downloaded lyrics as .lrc next to track", 203, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 8, 37, 180, 10
-    CONTROL         "Active line colour (RRGGBB):", IDC_STATIC, "Static", SS_LEFTNOWORDWRAP | WS_GROUP, 8, 53, 90, 8
-    EDITTEXT        204, 102, 51, 40, 12, ES_UPPERCASE | ES_AUTOHSCROLL
-    CONTROL         "Normal colour (RRGGBB):", IDC_STATIC, "Static", SS_LEFTNOWORDWRAP | WS_GROUP, 8, 68, 90, 8
-    EDITTEXT        209, 102, 66, 40, 12, ES_UPPERCASE | ES_AUTOHSCROLL
+    CONTROL         "Active line colour:", IDC_STATIC, "Static", SS_LEFTNOWORDWRAP | WS_GROUP, 8, 53, 55, 8
+    EDITTEXT        204, 66, 51, 40, 12, ES_UPPERCASE | ES_AUTOHSCROLL
+    CONTROL         "Normal colour:", IDC_STATIC, "Static", SS_LEFTNOWORDWRAP | WS_GROUP, 8, 68, 55, 8
+    EDITTEXT        209, 66, 66, 40, 12, ES_UPPERCASE | ES_AUTOHSCROLL
     CONTROL         "Font name:", IDC_STATIC, "Static", SS_LEFTNOWORDWRAP | WS_GROUP, 8, 84, 40, 8
     COMBOBOX        205, 48, 82, 100, 8, CBS_DROPDOWN | WS_VSCROLL | CBS_AUTOHSCROLL | WS_TABSTOP
     CONTROL         "Font size:", IDC_STATIC, "Static", SS_LEFTNOWORDWRAP | WS_GROUP, 156, 84, 32, 8
     EDITTEXT        206, 190, 82, 40, 12, ES_AUTOHSCROLL | ES_NUMBER
-    CONTROL         "Time offset (0.1s):", IDC_STATIC, "Static", SS_LEFTNOWORDWRAP | WS_GROUP, 8, 99, 60, 8
-    EDITTEXT        207, 48, 97, 30, 12, ES_AUTOHSCROLL | ES_NUMBER
-    CONTROL         "Line spacing (px):", IDC_STATIC, "Static", SS_LEFTNOWORDWRAP | WS_GROUP, 8, 114, 60, 8
-    EDITTEXT        208, 48, 112, 30, 12, ES_AUTOHSCROLL | ES_NUMBER
+    CONTROL         "Time offset (0.1s):", IDC_STATIC, "Static", SS_LEFTNOWORDWRAP | WS_GROUP, 8, 99, 90, 8
+    EDITTEXT        207, 104, 97, 30, 12, ES_AUTOHSCROLL | ES_NUMBER
+    CONTROL         "Line spacing (px):", IDC_STATIC, "Static", SS_LEFTNOWORDWRAP | WS_GROUP, 8, 114, 90, 8
+    EDITTEXT        208, 104, 112, 30, 12, ES_AUTOHSCROLL | ES_NUMBER
     PUSHBUTTON      "OK", IDOK, 78, 133, 50, 14, BS_DEFPUSHBUTTON
     PUSHBUTTON      "Cancel", IDCANCEL, 134, 133, 50, 14
 END
