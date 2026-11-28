@@ -1792,6 +1792,16 @@ static int lyric_render(HDC dc, int W, int H)
 // ---------------------------------------------------------------- vis config
 static HWND lrc_confwin;
 
+// EnumFontFamiliesEx callback: fill the font-name combo with installed font
+// families (de-duped - the API reports families more than once)
+static int CALLBACK font_enum_proc(const LOGFONT *lf, const TEXTMETRIC *, DWORD, LPARAM lpData)
+{
+	if (SendMessage((HWND)lpData, CB_FINDSTRINGEXACT, -1, (LPARAM)lf->lfFaceName) != CB_ERR)
+		return 1;
+	SendMessage((HWND)lpData, CB_ADDSTRING, 0, (LPARAM)lf->lfFaceName);
+	return 1;
+}
+
 BOOL CALLBACK LrcConfigDialogProc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
 	switch (m) {
@@ -1808,6 +1818,17 @@ BOOL CALLBACK LrcConfigDialogProc(HWND h, UINT m, WPARAM w, LPARAM l)
 		SendDlgItemMessage(h, 203, BM_SETCHECK, lrc_cfg.save_sidecar ? BST_CHECKED : BST_UNCHECKED, 0);
 		{ char b[32]; sprintf(b, "%06X", (unsigned)lrc_cfg.cur_color); SetDlgItemText(h, 204, b); }
 		{ char b[32]; sprintf(b, "%06X", (unsigned)lrc_cfg.norm_color); SetDlgItemText(h, 209, b); }
+		{
+			// editable system-font list (a typed name not in the list still
+			// works - CreateFontW falls back to Tahoma)
+			HDC dc = GetDC(0);
+			LOGFONT lf;
+			ZeroMemory(&lf, sizeof lf);
+			if (dc) {
+				EnumFontFamiliesEx(dc, &lf, font_enum_proc, (LPARAM)GetDlgItem(h, 205), 0);
+				ReleaseDC(0, dc);
+			}
+		}
 		SetDlgItemText(h, 205, lrc_cfg.font_name);
 		{ char b[16]; sprintf(b, "%d", lrc_cfg.font_size); SetDlgItemText(h, 206, b); }
 		{ char b[16]; sprintf(b, "%d", lrc_cfg.offset_tenths); SetDlgItemText(h, 207, b); }
