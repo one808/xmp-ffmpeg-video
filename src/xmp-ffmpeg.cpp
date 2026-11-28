@@ -143,11 +143,20 @@ static void video_attach(FFMPEG *f);
 static void video_detach();
 
 // ------------------------------------------------------------- diagnostic log
-// Always-on lightweight log so field problems are diagnosable from the file.
+// Lightweight log so field problems are diagnosable from the file.
 // Location: %TEMP%\xmp-ffmpeg-video.log
+//
+// Compile-time switch: build with -DXMP_LOG=0 to compile out ALL log output
+// (our logmsg lines AND FFmpeg's own log are no-ops, the file is never
+// created). Default 1 = on. Can be overridden by the compiler, e.g.
+// `cl /DXMP_LOG=0`.
+#ifndef XMP_LOG
+#define XMP_LOG 1
+#endif
 
 static void logmsg(const char *fmt, ...)
 {
+#if XMP_LOG
 	char dir[300];
 	if (!GetTempPathA(300, dir)) return;
 	strcat(dir, "xmp-ffmpeg-video.log");
@@ -159,12 +168,16 @@ static void logmsg(const char *fmt, ...)
 	va_end(ap);
 	fputc('\n', f);
 	fclose(f);
+#else
+	(void)fmt;
+#endif
 }
 
 // route FFmpeg's own log into ours - network/TLS failures then show up with
 // their real cause (403, handshake, DNS, ...)
 static void ff_log_cb(void *avcl, int level, const char *fmt, va_list vl)
 {
+#if XMP_LOG
 	if (level > AV_LOG_INFO) return;
 	char dir[300];
 	if (!GetTempPathA(300, dir)) return;
@@ -174,6 +187,9 @@ static void ff_log_cb(void *avcl, int level, const char *fmt, va_list vl)
 	fputs("  ff: ", f);
 	vfprintf(f, fmt, vl);
 	fclose(f);
+#else
+	(void)avcl; (void)level; (void)fmt; (void)vl;
+#endif
 }
 
 // ---------------------------------------------------------------- XMPFILE I/O

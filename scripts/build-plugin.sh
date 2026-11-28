@@ -6,7 +6,11 @@ CROSS=$PWD/sandbox/cross_compilers/mingw-w64-i686
 TRIPLE=i686-w64-mingw32
 PREFIX=$CROSS/$TRIPLE
 CFLAGS_XP="-O2 -march=pentium3 -mtune=athlon-xp -mfpmath=sse -msse"
-DEFS_XP=""
+# XMP_LOG: 1 = write the diagnostic log to %TEMP%\xmp-ffmpeg-video.log (default),
+# 0 = compile out ALL logging (logmsg + FFmpeg's own log become no-ops, no file).
+# Set the env var or edit the value to flip; it overrides the source's #ifndef default.
+XMP_LOG="${XMP_LOG:-1}"
+DEFS_XP="-DXMP_LOG=$XMP_LOG"
 
 export PATH=$CROSS/bin:$PATH
 mkdir -p build
