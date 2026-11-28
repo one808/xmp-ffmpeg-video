@@ -847,13 +847,14 @@ struct LRC_CFG {
 	char font_name[64];
 	int  font_size;     // pixel height
 	int  offset_tenths; // user time offset, tenths of a second (+ = lyrics lag)
+	int  line_gap;      // extra px between lyric lines (line height = font_size + line_gap)
 };
 static LRC_CFG lrc_cfg;
 static void bcpy(char *dst, size_t dstn, const char *src); // forward (defn below)
 
 static void lrc_cfg_defaults()
 {
-	static const LRC_CFG d = { "http://lrc.8od.top:88", 1, 1, 0x00ff88, "SimSun", 18, 0 };
+	static const LRC_CFG d = { "http://lrc.8od.top:88", 1, 1, 0x00ff88, "SimSun", 18, 0, 6 };
 	lrc_cfg = d;
 }
 static void lrc_cfg_load()
@@ -868,6 +869,7 @@ static void lrc_cfg_load()
 	{ char buf[64]; if (xmpfreg->GetString(LRC_REGSEC, "FontName", buf, sizeof buf)) bcpy(lrc_cfg.font_name, sizeof lrc_cfg.font_name, buf); }
 	if (xmpfreg->GetInt(LRC_REGSEC, "FontSize", &v) && v >= 8 && v <= 72) lrc_cfg.font_size = v;
 	if (xmpfreg->GetInt(LRC_REGSEC, "OffsetTenths", &v) && v >= -600 && v <= 600) lrc_cfg.offset_tenths = v;
+	if (xmpfreg->GetInt(LRC_REGSEC, "LineGap", &v) && v >= 0 && v <= 48) lrc_cfg.line_gap = v;
 }
 static void lrc_cfg_save()
 {
@@ -879,6 +881,7 @@ static void lrc_cfg_save()
 	xmpfreg->SetString(LRC_REGSEC, "FontName", lrc_cfg.font_name);
 	xmpfreg->SetInt(LRC_REGSEC, "FontSize", &lrc_cfg.font_size);
 	{ int v = lrc_cfg.offset_tenths; xmpfreg->SetInt(LRC_REGSEC, "OffsetTenths", &v); }
+	{ int v = lrc_cfg.line_gap; xmpfreg->SetInt(LRC_REGSEC, "LineGap", &v); }
 }
 
 // -------------------------------------------------------------- lyrics store
@@ -1665,7 +1668,7 @@ static int lyric_render(HDC dc, int W, int H)
 	// returns 1 if lyrics were drawn, 0 otherwise (caller falls back to black)
 	// effective time = playback clock - user offset (+offset = lyrics lag)
 	double t = video_clock_now() - (double)lrc_cfg.offset_tenths * 0.1;
-	int lh = lrc_cfg.font_size + 6;      // px the scroll travels per line
+	int lh = lrc_cfg.font_size + lrc_cfg.line_gap; // px the scroll travels per line
 	int cy = H / 2;                      // focal line anchored mid-panel
 
 	// fp = focal position in line-space (fractional -> smooth sub-line scroll):
@@ -1791,6 +1794,7 @@ BOOL CALLBACK LrcConfigDialogProc(HWND h, UINT m, WPARAM w, LPARAM l)
 		SetDlgItemText(h, 205, lrc_cfg.font_name);
 		{ char b[16]; sprintf(b, "%d", lrc_cfg.font_size); SetDlgItemText(h, 206, b); }
 		{ char b[16]; sprintf(b, "%d", lrc_cfg.offset_tenths); SetDlgItemText(h, 207, b); }
+		{ char b[16]; sprintf(b, "%d", lrc_cfg.line_gap); SetDlgItemText(h, 208, b); }
 		return 1;
 	case WM_COMMAND:
 		switch (LOWORD(w)) {
@@ -1807,6 +1811,7 @@ BOOL CALLBACK LrcConfigDialogProc(HWND h, UINT m, WPARAM w, LPARAM l)
 			bcpy(lrc_cfg.font_name, sizeof lrc_cfg.font_name, buf);
 			{ int sz = GetDlgItemInt(h, 206, NULL, TRUE); if (sz >= 8 && sz <= 72) lrc_cfg.font_size = sz; }
 			{ int of = GetDlgItemInt(h, 207, NULL, TRUE); if (of >= -600 && of <= 600) lrc_cfg.offset_tenths = of; }
+			{ int lg = GetDlgItemInt(h, 208, NULL, TRUE); if (lg >= 0 && lg <= 48) lrc_cfg.line_gap = lg; }
 			lrc_cfg_save();
 			EndDialog(h, 1);
 			break;
