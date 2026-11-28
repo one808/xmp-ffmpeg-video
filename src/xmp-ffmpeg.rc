@@ -9,8 +9,9 @@
 // vis config dialog (opened by the "FFmpeg video / lyrics" vis area's config
 // button; handled by LrcConfigDialogProc in xmp-ffmpeg.cpp). Control ids:
 //  201 service url, 202 download-online, 203 save-.lrc, 204 active-line colour,
-//  205 font name, 206 font size, 208 line spacing.
-1000 DIALOGEX 0, 0, 240, 139
+//  209 normal colour, 205 font name, 206 font size, 207 time offset, 208 line
+//  spacing.
+1000 DIALOGEX 0, 0, 240, 166
 STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "FFmpeg lyrics"
 FONT 8, "MS Sans Serif", 0, 0, 0x0
@@ -19,18 +20,20 @@ BEGIN
     EDITTEXT        201, 66, 7, 166, 12, ES_AUTOHSCROLL
     CONTROL         "Download lyrics online when missing", 202, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 8, 24, 150, 10
     CONTROL         "Save downloaded lyrics as .lrc next to track", 203, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 8, 37, 180, 10
-    CONTROL         "Active line colour (RRGGBB):", IDC_STATIC, "Static", SS_LEFTNOWORDWRAP | WS_GROUP, 8, 53, 85, 8
-    EDITTEXT        204, 96, 51, 40, 12, ES_UPPERCASE | ES_AUTOHSCROLL
-    CONTROL         "Font name:", IDC_STATIC, "Static", SS_LEFTNOWORDWRAP | WS_GROUP, 144, 53, 35, 8
-    EDITTEXT        205, 144, 61, 88, 12, ES_AUTOHSCROLL
-    CONTROL         "Font size:", IDC_STATIC, "Static", SS_LEFTNOWORDWRAP | WS_GROUP, 8, 69, 35, 8
-    EDITTEXT        206, 46, 67, 30, 12, ES_AUTOHSCROLL | ES_NUMBER
-    CONTROL         "Time offset (0.1s):", IDC_STATIC, "Static", SS_LEFTNOWORDWRAP | WS_GROUP, 8, 84, 60, 8
-    EDITTEXT        207, 72, 82, 30, 12, ES_AUTOHSCROLL | ES_NUMBER
-    CONTROL         "Line spacing (px):", IDC_STATIC, "Static", SS_LEFTNOWORDWRAP | WS_GROUP, 8, 99, 60, 8
-    EDITTEXT        208, 72, 97, 30, 12, ES_AUTOHSCROLL | ES_NUMBER
-    PUSHBUTTON      "OK", IDOK, 78, 118, 50, 14, BS_DEFPUSHBUTTON
-    PUSHBUTTON      "Cancel", IDCANCEL, 134, 118, 50, 14
+    CONTROL         "Active line colour (RRGGBB):", IDC_STATIC, "Static", SS_LEFTNOWORDWRAP | WS_GROUP, 8, 53, 90, 8
+    EDITTEXT        204, 102, 51, 40, 12, ES_UPPERCASE | ES_AUTOHSCROLL
+    CONTROL         "Normal colour (RRGGBB):", IDC_STATIC, "Static", SS_LEFTNOWORDWRAP | WS_GROUP, 8, 68, 90, 8
+    EDITTEXT        209, 102, 66, 40, 12, ES_UPPERCASE | ES_AUTOHSCROLL
+    CONTROL         "Font name:", IDC_STATIC, "Static", SS_LEFTNOWORDWRAP | WS_GROUP, 8, 84, 40, 8
+    EDITTEXT        205, 48, 82, 184, 12, ES_AUTOHSCROLL
+    CONTROL         "Font size:", IDC_STATIC, "Static", SS_LEFTNOWORDWRAP | WS_GROUP, 8, 99, 40, 8
+    EDITTEXT        206, 48, 97, 30, 12, ES_AUTOHSCROLL | ES_NUMBER
+    CONTROL         "Time offset (0.1s):", IDC_STATIC, "Static", SS_LEFTNOWORDWRAP | WS_GROUP, 8, 114, 60, 8
+    EDITTEXT        207, 48, 112, 30, 12, ES_AUTOHSCROLL | ES_NUMBER
+    CONTROL         "Line spacing (px):", IDC_STATIC, "Static", SS_LEFTNOWORDWRAP | WS_GROUP, 8, 129, 60, 8
+    EDITTEXT        208, 48, 127, 30, 12, ES_AUTOHSCROLL | ES_NUMBER
+    PUSHBUTTON      "OK", IDOK, 78, 148, 50, 14, BS_DEFPUSHBUTTON
+    PUSHBUTTON      "Cancel", IDCANCEL, 134, 148, 50, 14
 END
 
 VS_VERSION_INFO VERSIONINFO

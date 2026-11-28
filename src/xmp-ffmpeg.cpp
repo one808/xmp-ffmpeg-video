@@ -860,6 +860,7 @@ struct LRC_CFG {
 	int  use_service;   // download from the service when no local lyrics
 	int  save_sidecar;  // save downloaded lyrics as a .lrc next to the track
 	DWORD cur_color;    // 0xRRGGBB, colour of the active line
+	DWORD norm_color;   // 0xRRGGBB, colour of the non-active lines
 	char font_name[64];
 	int  font_size;     // pixel height
 	int  offset_tenths; // user time offset, tenths of a second (+ = lyrics lag)
@@ -870,7 +871,7 @@ static void bcpy(char *dst, size_t dstn, const char *src); // forward (defn belo
 
 static void lrc_cfg_defaults()
 {
-	static const LRC_CFG d = { "http://lrc.8od.top:88", 1, 1, 0x00ff88, "SimSun", 18, 0, 6 };
+	static const LRC_CFG d = { "http://lrc.8od.top:88", 1, 1, 0x00ff88, 0x808080, "SimSun", 18, 0, 6 };
 	lrc_cfg = d;
 }
 static void lrc_cfg_load()
@@ -882,6 +883,7 @@ static void lrc_cfg_load()
 	if (xmpfreg->GetInt(LRC_REGSEC, "UseService", &v))  lrc_cfg.use_service  = v ? 1 : 0;
 	if (xmpfreg->GetInt(LRC_REGSEC, "SaveSidecar", &v)) lrc_cfg.save_sidecar = v ? 1 : 0;
 	if (xmpfreg->GetInt(LRC_REGSEC, "CurColor", &v))    lrc_cfg.cur_color    = (DWORD)v;
+	if (xmpfreg->GetInt(LRC_REGSEC, "NormColor", &v))   lrc_cfg.norm_color   = (DWORD)v;
 	{ char buf[64]; if (xmpfreg->GetString(LRC_REGSEC, "FontName", buf, sizeof buf)) bcpy(lrc_cfg.font_name, sizeof lrc_cfg.font_name, buf); }
 	if (xmpfreg->GetInt(LRC_REGSEC, "FontSize", &v) && v >= 8 && v <= 72) lrc_cfg.font_size = v;
 	if (xmpfreg->GetInt(LRC_REGSEC, "OffsetTenths", &v) && v >= -600 && v <= 600) lrc_cfg.offset_tenths = v;
@@ -894,6 +896,7 @@ static void lrc_cfg_save()
 	{ int v = lrc_cfg.use_service  ? 1 : 0; xmpfreg->SetInt(LRC_REGSEC, "UseService", &v); }
 	{ int v = lrc_cfg.save_sidecar ? 1 : 0; xmpfreg->SetInt(LRC_REGSEC, "SaveSidecar", &v); }
 	{ int v = (int)lrc_cfg.cur_color;         xmpfreg->SetInt(LRC_REGSEC, "CurColor", &v); }
+	{ int v = (int)lrc_cfg.norm_color;        xmpfreg->SetInt(LRC_REGSEC, "NormColor", &v); }
 	xmpfreg->SetString(LRC_REGSEC, "FontName", lrc_cfg.font_name);
 	xmpfreg->SetInt(LRC_REGSEC, "FontSize", &lrc_cfg.font_size);
 	{ int v = lrc_cfg.offset_tenths; xmpfreg->SetInt(LRC_REGSEC, "OffsetTenths", &v); }
@@ -1760,11 +1763,8 @@ static int lyric_render(HDC dc, int W, int H)
 		}
 	}
 
-	int bg = (int)vis_colors[0];
-	int txt = (int)vis_colors[1];
-	int R = (bg >> 16) & 0xff, G = (bg >> 8) & 0xff, B = bg & 0xff;
-	int tr = (txt >> 16) & 0xff, tg = (txt >> 8) & 0xff, tb = txt & 0xff;
-	int dr = R + (tr - R) / 2, dg = G + (tg - G) / 2, db = B + (tb - B) / 2; // dimmed
+	// the active line uses cur_color; every other line uses the configured
+	// normal colour (norm_color)
 	HFONT oldf = (HFONT)SelectObject(dc, lrc_font);
 	HPEN oldpen = (HPEN)SelectObject(dc, GetStockObject(NULL_PEN));
 	HGDIOBJ oldbr = SelectObject(dc, GetStockObject(NULL_BRUSH));
@@ -1773,14 +1773,14 @@ static int lyric_render(HDC dc, int W, int H)
 		double dist = (double)idxs[k] - fp;
 		int y = cy + (int)(dist * lh + 0.5); // smooth sub-line position
 		// a line is colored only while the MID LINE crosses its band:
-		// enter as the band's top edge reaches the mid line, back to dim as
-		// the bottom edge leaves - the next line takes over at exactly that
-		// instant (both at |dist| = 0.5)
+		// enter as the band's top edge reaches the mid line, back to the
+		// normal colour as the bottom edge leaves - the next line takes over
+		// at exactly that instant (both at |dist| = 0.5)
 		int onmid = (dist <= 0.5 && dist >= -0.5);
 		wchar_t wtext[512];
 		MultiByteToWideChar(CP_UTF8, 0, texts[k], -1, wtext, 512);
 		RECT rc = { 0, y - lh / 2, W, y + lh / 2 };
-		SetTextColor(dc, onmid ? (COLORREF)lrc_cfg.cur_color : RGB(dr, dg, db));
+		SetTextColor(dc, onmid ? (COLORREF)lrc_cfg.cur_color : (COLORREF)lrc_cfg.norm_color);
 		DrawTextW(dc, wtext, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 	}
 	SelectObject(dc, oldf);
@@ -1807,6 +1807,7 @@ BOOL CALLBACK LrcConfigDialogProc(HWND h, UINT m, WPARAM w, LPARAM l)
 		SendDlgItemMessage(h, 202, BM_SETCHECK, lrc_cfg.use_service ? BST_CHECKED : BST_UNCHECKED, 0);
 		SendDlgItemMessage(h, 203, BM_SETCHECK, lrc_cfg.save_sidecar ? BST_CHECKED : BST_UNCHECKED, 0);
 		{ char b[32]; sprintf(b, "%06X", (unsigned)lrc_cfg.cur_color); SetDlgItemText(h, 204, b); }
+		{ char b[32]; sprintf(b, "%06X", (unsigned)lrc_cfg.norm_color); SetDlgItemText(h, 209, b); }
 		SetDlgItemText(h, 205, lrc_cfg.font_name);
 		{ char b[16]; sprintf(b, "%d", lrc_cfg.font_size); SetDlgItemText(h, 206, b); }
 		{ char b[16]; sprintf(b, "%d", lrc_cfg.offset_tenths); SetDlgItemText(h, 207, b); }
@@ -1823,6 +1824,8 @@ BOOL CALLBACK LrcConfigDialogProc(HWND h, UINT m, WPARAM w, LPARAM l)
 			lrc_cfg.save_sidecar = SendDlgItemMessage(h, 203, BM_GETCHECK, 0, 0) == BST_CHECKED;
 			{ char cb[32]; GetDlgItemText(h, 204, cb, sizeof cb);
 			  if (strlen(cb) == 6) lrc_cfg.cur_color = (DWORD)strtoul(cb, 0, 16); }
+			{ char cb[32]; GetDlgItemText(h, 209, cb, sizeof cb);
+			  if (strlen(cb) == 6) lrc_cfg.norm_color = (DWORD)strtoul(cb, 0, 16); }
 			GetDlgItemText(h, 205, buf, sizeof buf);
 			bcpy(lrc_cfg.font_name, sizeof lrc_cfg.font_name, buf);
 			{ int sz = GetDlgItemInt(h, 206, NULL, TRUE); if (sz >= 8 && sz <= 72) lrc_cfg.font_size = sz; }
