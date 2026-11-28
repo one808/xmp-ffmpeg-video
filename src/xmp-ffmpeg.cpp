@@ -682,14 +682,51 @@ static void video_tick()
 		// stale frames must NOT be shown (they'd flash old content and clear
 		// `seeking` early) - keep the area black until a frame in the target
 		// window is shown.
-		if (video.frame_pts > t + 0.06) break;   // in the future - wait
+		static DWORD s_ra_log = 0; // throttle the re-anchor log to <=1/2s
+		if (video.frame_pts > t + 0.06) {
+			// in the future. Normally: wait. But a FORWARD timestamp gap in
+			// the source (the service m3u8 drops content - we saw it inside
+			// the "ad" upload) leaves the rebased timeline ahead of the
+			// clock FOREVER and this gate freezes the picture (audio only).
+			// More than 1s ahead = re-anchor the timeline to the clock and
+			// show this frame now.
+			if (!video.seeking && video.frame_pts > t + 1.0) {
+				double raw = video.frame_pts - video.pts_shift;
+				video.pts_shift = t - raw;
+				video.frame_pts = t;
+				video.last_pts = t;
+				DWORD nw = GetTickCount();
+				if (nw - s_ra_log > 2000) {
+					logmsg("vt: fwd-gap re-anchor raw=%.2f t=%.2f (shift=%.2f)",
+						raw, t, video.pts_shift);
+					s_ra_log = nw;
+				}
+			} else break; // in the future - wait
+		}
 		double drop_floor = t - 0.30;
 		if (video.seeking && video.seek_floor > drop_floor)
 			drop_floor = video.seek_floor;       // after a seek: no pre-target picture
-		if (video.frame_pts < drop_floor && (budget > 2 || video.seeking)) { // behind - drop
-			video.have_frame = FALSE;
-			ndrop++;
-			continue;
+		if (video.frame_pts < drop_floor) {
+			if (!video.seeking && video.frame_pts < t - 1.0) {
+				// far behind: the timeline drifted (splice/starvation crawl).
+				// Re-anchor to the clock; showing this frame now beats a
+				// slideshow crawl of stale frames.
+				double raw = video.frame_pts - video.pts_shift;
+				video.pts_shift = t - raw;
+				video.frame_pts = t;
+				video.last_pts = t;
+				DWORD nw = GetTickCount();
+				if (nw - s_ra_log > 2000) {
+					logmsg("vt: stale re-anchor raw=%.2f t=%.2f (shift=%.2f)",
+						raw, t, video.pts_shift);
+					s_ra_log = nw;
+				}
+				// fall through: show the frame at "now"
+			} else if (video.seeking || budget > 2) { // small lag: drop (unless budget spent)
+				video.have_frame = FALSE;
+				ndrop++;
+				continue;
+			}
 		}
 		video_render_frame(); // scale into video.dib (under lock); sets have_new
 		shown_pts = video.frame_pts;
