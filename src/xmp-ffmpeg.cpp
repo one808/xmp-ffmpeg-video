@@ -656,11 +656,18 @@ static void video_tick()
 					logmsg("vt: seek rebase raw=%.2f ref=%.2f (shift=%.2f)",
 						pts, ref, video.pts_shift);
 				} else video.pts_shift = 0;
-			} else if (pts < video.last_pts - 1.0) {
-				// mid-playback timeline restart at the splice point: rebase
-				video.pts_shift += video.last_pts - pts;
-				logmsg("vt: pts restart raw=%.2f last=%.2f (shift=%.2f)",
-					pts, video.last_pts, video.pts_shift);
+			} else {
+				// mid-playback timeline restart at the splice point: rebase.
+				// Compare against the PREVIOUS RAW pts (last_pts holds the
+				// shifted value): one jump = one rebase; firing per frame
+				// would grow the shift every frame and push all frames "in
+				// the future" (frozen picture - the bug this replaces).
+				double prev_raw = video.last_pts - video.pts_shift;
+				if (prev_raw > 0 && pts < prev_raw - 1.0) {
+					video.pts_shift += prev_raw - pts;
+					logmsg("vt: pts restart raw=%.2f prev_raw=%.2f (shift=%.2f)",
+						pts, prev_raw, video.pts_shift);
+				}
 			}
 			pts += video.pts_shift;
 			if (pts > video.last_pts) video.last_pts = pts;
